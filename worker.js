@@ -3,13 +3,14 @@
  * 依赖 File System Access API（Chrome / Edge）
  */
 
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB 分片
+const CHUNK_SIZE = 2 * 1024 * 1024;        // 2MB 分片
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 2;
 const STORE_META = 'meta';
-const CHUNK_TIMEOUT_MS = 20000;     // 单片下载超时
-const PROBE_TIMEOUT_MS = 20000;     // 探测元信息超时
-const MAX_RETRIES = 3;
+const CHUNK_TIMEOUT_MS = 60000;            // 单片下载超时 60s
+const PROBE_TIMEOUT_MS = 30000;            // 探测元信息超时 30s
+const MAX_RETRIES = 3;                     // 单片最大重试次数
+const STALE_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 未完成记录保留 7 天
 
 // ==================== Worker 入口 ====================
 export default {
@@ -49,6 +50,7 @@ async function handleProxy(request) {
       forwardHeaders.set(key, value);
     }
   }
+  // 要求上游返回未压缩内容，避免长度不匹配
   forwardHeaders.set('Accept-Encoding', 'identity');
 
   try {
@@ -73,6 +75,7 @@ async function handleProxy(request) {
       if (val) responseHeaders.set(name, val);
     }
 
+    // 移除可能引起长度不匹配的头
     responseHeaders.delete('content-encoding');
     responseHeaders.delete('transfer-encoding');
     responseHeaders.delete('content-length');
@@ -81,6 +84,7 @@ async function handleProxy(request) {
       responseHeaders.set(k, v);
     }
 
+    // 从 Content-Range 计算精确长度，用 FixedLengthStream 保证 Content-Length 正确
     let expectedLength = null;
     const contentRange = upstream.headers.get('content-range');
     if (contentRange) {
@@ -193,7 +197,7 @@ function getHTML() {
 </div>
 
 <script>
-// ==================== 常量 ====================
+// ==================== 常量（由 Worker 注入） ====================
 var CHUNK_SIZE = ${CHUNK_SIZE};
 var DB_NAME = '${DB_NAME}';
 var DB_VERSION = ${DB_VERSION};
@@ -201,6 +205,7 @@ var STORE_META = '${STORE_META}';
 var CHUNK_TIMEOUT_MS = ${CHUNK_TIMEOUT_MS};
 var PROBE_TIMEOUT_MS = ${PROBE_TIMEOUT_MS};
 var MAX_RETRIES = ${MAX_RETRIES};
+var STALE_AGE_MS = ${STALE_AGE_MS};
 
 var abortController = null;
 
@@ -254,6 +259,40 @@ async function idbDelete(storeName, key) {
     var tx = db.transaction(storeName, 'readwrite');
     var req = tx.objectStore(storeName).delete(key);
     req.onsuccess = function () { resolve(); };
+    req.onerror = function () { reject(req.error); };
+  });
+}
+
+async function idbGetAll(storeName) {
+  var db = await openDB();
+  return new Promise(function (resolve, reject) {
+    var tx = db.transaction(storeName, 'readonly');
+    var store = tx.objectStore(storeName);
+    var req = store.getAll();
+    req.onsuccess = function () { resolve(req.result || []); };
+    req.onerror = function () { reject(req.error); };
+  });
+}
+
+// 清理超过 maxAgeMs 未更新的记录
+async function idbCleanupStale(maxAgeMs) {
+  var db = await openDB();
+  return new Promise(function (resolve, reject) {
+    var tx = db.transaction(STORE_META, 'readwrite');
+    var store = tx.objectStore(STORE_META);
+    var req = store.openCursor();
+    req.onsuccess = function (e) {
+      var cursor = e.target.result;
+      if (cursor) {
+        var meta = cursor.value;
+        if (meta && meta.updatedAt && (Date.now() - meta.updatedAt > maxAgeMs)) {
+          cursor.delete();
+        }
+        cursor.continue();
+      } else {
+        resolve();
+      }
+    };
     req.onerror = function () { reject(req.error); };
   });
 }
@@ -444,25 +483,35 @@ async function startDownload() {
   var writableClosed = false;
 
   try {
+    // 0. 清理过期记录（超过 STALE_AGE_MS 未更新）
+    try { await idbCleanupStale(STALE_AGE_MS); } catch (_) {}
+
     // 1. 尝试恢复之前的文件句柄
     var existingMeta = await idbGet(STORE_META, rawUrl);
     var fileHandle = null;
 
     if (existingMeta && existingMeta.fileHandle) {
+      var recovered = false;
       try {
         var perm = await existingMeta.fileHandle.queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          perm = await existingMeta.fileHandle.requestPermission({ mode: 'readwrite' });
+        }
         if (perm === 'granted') {
+          // 验证文件是否仍然存在（被删除/移动会抛 NotFoundError）
+          await existingMeta.fileHandle.getFile();
           fileHandle = existingMeta.fileHandle;
+          recovered = true;
           setStatus('已恢复之前的文件句柄，准备续传…', 'info');
-        } else if (perm === 'prompt') {
-          var req = await existingMeta.fileHandle.requestPermission({ mode: 'readwrite' });
-          if (req === 'granted') {
-            fileHandle = existingMeta.fileHandle;
-            setStatus('已恢复之前的文件句柄，准备续传…', 'info');
-          }
         }
       } catch (e) {
-        fileHandle = null;
+        console.warn('恢复文件句柄失败，文件可能已被删除或移动', e);
+      }
+      if (!recovered) {
+        // 清理失效记录，走新文件流程
+        await idbDelete(STORE_META, rawUrl);
+        existingMeta = null;
+        setStatus('之前的文件已失效或无法访问，请重新选择保存位置', 'info');
       }
     }
 
@@ -483,7 +532,7 @@ async function startDownload() {
       existingMeta = null;
     }
 
-    // 3. 探测文件信息（传入 abortController.signal，支持取消 + 30 秒超时）
+    // 3. 探测文件信息（传 signal，支持取消 + 30 秒超时）
     setStatus('正在探测文件信息…', 'info');
     var meta = await probeFile(proxyUrl, abortController.signal);
 
@@ -504,10 +553,10 @@ async function startDownload() {
       }
     }
 
-    // 5. 创建可写流（保留已有内容，用于续传）
+    // 5. 打开可写流（保留已有内容，用于续传）
     writable = await fileHandle.createWritable({ keepExistingData: true });
 
-    // 6. 记录 meta
+    // 6. 写入 meta
     var metaRecord = {
       url: rawUrl,
       fileSize: meta.fileSize,
@@ -575,26 +624,29 @@ function cancelDownload() {
   if (abortController) abortController.abort();
 }
 
-// ==================== 页面加载时恢复未完成提示 ====================
+// ==================== 页面加载：清理过期 + 显示最近未完成记录 ====================
 window.addEventListener('DOMContentLoaded', async function () {
   try {
-    var db = await openDB();
-    var tx = db.transaction(STORE_META, 'readonly');
-    var store = tx.objectStore(STORE_META);
-    var req = store.openCursor();
-    req.onsuccess = function (e) {
-      var cursor = e.target.result;
-      if (cursor) {
-        var m = cursor.value;
-        if (m.nextChunk < m.totalChunks) {
-          $('urlInput').value = m.url;
-          setStatus('检测到未完成的下载（' + m.fileName + '，已下载 '
-            + m.nextChunk + '/' + m.totalChunks + ' 片），点击"开始下载"继续', 'info');
-        }
-        cursor.continue();
-      }
-    };
-  } catch (e) {}
+    // 1. 清理超过 STALE_AGE_MS 的旧记录
+    try { await idbCleanupStale(STALE_AGE_MS); } catch (_) {}
+
+    // 2. 读取所有记录，找出最近的未完成项提示用户
+    var metas = await idbGetAll(STORE_META);
+    var pending = metas.filter(function (m) {
+      return m && typeof m.nextChunk === 'number' && m.nextChunk < m.totalChunks;
+    });
+    if (pending.length > 0) {
+      pending.sort(function (a, b) {
+        return (b.updatedAt || 0) - (a.updatedAt || 0);
+      });
+      var latest = pending[0];
+      $('urlInput').value = latest.url;
+      setStatus('检测到未完成的下载（' + latest.fileName + '，已下载 '
+        + latest.nextChunk + '/' + latest.totalChunks + ' 片），点击"开始下载"继续', 'info');
+    }
+  } catch (e) {
+    console.warn('页面加载初始化失败', e);
+  }
 });
 
 $('urlInput').addEventListener('keydown', function (e) {
