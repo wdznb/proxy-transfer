@@ -3,12 +3,13 @@
  * 依赖 File System Access API（Chrome / Edge）
  */
 
-const CHUNK_SIZE = 1024 * 1024; // 2MB 分片
+const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB 分片
 const DB_NAME = 'cf-downloader-db';
-const DB_VERSION = 2; // 从 1 升级，删除旧 chunks store
+const DB_VERSION = 2;
 const STORE_META = 'meta';
-const CHUNK_TIMEOUT_MS = 10000;
-const MAX_RETRIES = 10;
+const CHUNK_TIMEOUT_MS = 20000;     // 单片下载超时
+const PROBE_TIMEOUT_MS = 20000;     // 探测元信息超时
+const MAX_RETRIES = 3;
 
 // ==================== Worker 入口 ====================
 export default {
@@ -48,7 +49,6 @@ async function handleProxy(request) {
       forwardHeaders.set(key, value);
     }
   }
-  // 要求上游返回未压缩内容，避免长度不匹配
   forwardHeaders.set('Accept-Encoding', 'identity');
 
   try {
@@ -73,7 +73,6 @@ async function handleProxy(request) {
       if (val) responseHeaders.set(name, val);
     }
 
-    // 移除可能冲突的头
     responseHeaders.delete('content-encoding');
     responseHeaders.delete('transfer-encoding');
     responseHeaders.delete('content-length');
@@ -82,7 +81,6 @@ async function handleProxy(request) {
       responseHeaders.set(k, v);
     }
 
-    // 从 Content-Range 计算精确长度，用 FixedLengthStream 保证 Content-Length 正确
     let expectedLength = null;
     const contentRange = upstream.headers.get('content-range');
     if (contentRange) {
@@ -201,6 +199,7 @@ var DB_NAME = '${DB_NAME}';
 var DB_VERSION = ${DB_VERSION};
 var STORE_META = '${STORE_META}';
 var CHUNK_TIMEOUT_MS = ${CHUNK_TIMEOUT_MS};
+var PROBE_TIMEOUT_MS = ${PROBE_TIMEOUT_MS};
 var MAX_RETRIES = ${MAX_RETRIES};
 
 var abortController = null;
@@ -294,59 +293,90 @@ function guessFileName(url) {
   }
 }
 
-// ==================== 探测文件元信息 ====================
-async function probeFile(proxyUrl) {
-  var resp = await fetch(proxyUrl, {
-    headers: { Range: 'bytes=0-0' },
-    cache: 'no-store',
-  });
-  if (!resp.ok && resp.status !== 206) {
-    throw new Error('无法获取文件信息，HTTP ' + resp.status);
-  }
-  var fileSize = 0;
-  var contentRange = resp.headers.get('Content-Range');
-  if (contentRange) {
-    var m = contentRange.match(/\\/(\\d+)\\s*$/);
-    if (m) fileSize = parseInt(m[1], 10);
-  }
-  if (!fileSize) {
-    var cl = resp.headers.get('Content-Length');
-    if (cl) fileSize = parseInt(cl, 10);
-  }
-  if (!fileSize) {
-    throw new Error('服务器未返回文件大小，无法分段下载');
+// ==================== 探测文件元信息（带超时 + 可取消） ====================
+async function probeFile(proxyUrl, outerSignal) {
+  var ctrl = new AbortController();
+  var timedOut = false;
+  var timer = setTimeout(function () {
+    timedOut = true;
+    ctrl.abort();
+  }, PROBE_TIMEOUT_MS);
+
+  var onOuterAbort = function () { ctrl.abort(); };
+  if (outerSignal) {
+    if (outerSignal.aborted) {
+      clearTimeout(timer);
+      throw new Error('ABORTED');
+    }
+    outerSignal.addEventListener('abort', onOuterAbort, { once: true });
   }
 
-  var contentType = resp.headers.get('Content-Type') || 'application/octet-stream';
-  var etag = resp.headers.get('ETag') || '';
-
-  var fileName = 'download';
   try {
-    var u = new URL(proxyUrl, location.origin);
-    var targetUrl = u.searchParams.get('url');
-    if (targetUrl) {
-      var pathname = new URL(targetUrl).pathname;
-      var parts = pathname.split('/').filter(Boolean);
-      var last = parts[parts.length - 1];
-      if (last) fileName = decodeURIComponent(last);
-    }
-  } catch (e) {}
+    var resp = await fetch(proxyUrl, {
+      headers: { Range: 'bytes=0-0' },
+      signal: ctrl.signal,
+      cache: 'no-store',
+    });
 
-  var cd = resp.headers.get('Content-Disposition');
-  if (cd) {
-    var fn = cd.match(/filename\\*?=(?:UTF-8'')?["']?([^"'\\s;]+)/i);
-    if (fn) {
-      try { fileName = decodeURIComponent(fn[1]); } catch (e) {}
+    if (!resp.ok && resp.status !== 206) {
+      throw new Error('无法获取文件信息，HTTP ' + resp.status);
+    }
+
+    var fileSize = 0;
+    var contentRange = resp.headers.get('Content-Range');
+    if (contentRange) {
+      var m = contentRange.match(/\\/(\\d+)\\s*$/);
+      if (m) fileSize = parseInt(m[1], 10);
+    }
+    if (!fileSize) {
+      var cl = resp.headers.get('Content-Length');
+      if (cl) fileSize = parseInt(cl, 10);
+    }
+    if (!fileSize) {
+      throw new Error('服务器未返回文件大小，无法分段下载');
+    }
+
+    var contentType = resp.headers.get('Content-Type') || 'application/octet-stream';
+    var etag = resp.headers.get('ETag') || '';
+
+    var fileName = 'download';
+    try {
+      var u = new URL(proxyUrl, location.origin);
+      var targetUrl = u.searchParams.get('url');
+      if (targetUrl) {
+        var pathname = new URL(targetUrl).pathname;
+        var parts = pathname.split('/').filter(Boolean);
+        var last = parts[parts.length - 1];
+        if (last) fileName = decodeURIComponent(last);
+      }
+    } catch (e) {}
+
+    var cd = resp.headers.get('Content-Disposition');
+    if (cd) {
+      var fn = cd.match(/filename\\*?=(?:UTF-8'')?["']?([^"'\\s;]+)/i);
+      if (fn) {
+        try { fileName = decodeURIComponent(fn[1]); } catch (e) {}
+      }
+    }
+
+    return {
+      fileSize: fileSize,
+      totalChunks: Math.ceil(fileSize / CHUNK_SIZE),
+      contentType: contentType,
+      etag: etag,
+      fileName: fileName
+    };
+  } catch (e) {
+    if (timedOut) {
+      throw new Error('探测文件信息超时（' + (PROBE_TIMEOUT_MS / 1000) + ' 秒），请检查目标地址是否可访问');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    if (outerSignal) {
+      outerSignal.removeEventListener('abort', onOuterAbort);
     }
   }
-
-  return {
-    fileSize: fileSize,
-    totalChunks: Math.ceil(fileSize / CHUNK_SIZE),
-    contentType: contentType,
-    etag: etag,
-    fileName: fileName
-  };
 }
 
 // ==================== 下载单片（带超时与重试） ====================
@@ -436,7 +466,7 @@ async function startDownload() {
       }
     }
 
-    // 2. 没有可用句柄则弹出保存对话框（必须在用户手势中）
+    // 2. 没有可用句柄则弹出保存对话框
     if (!fileHandle) {
       setStatus('请选择保存位置…', 'info');
       try {
@@ -453,9 +483,9 @@ async function startDownload() {
       existingMeta = null;
     }
 
-    // 3. 探测文件信息
+    // 3. 探测文件信息（传入 abortController.signal，支持取消 + 30 秒超时）
     setStatus('正在探测文件信息…', 'info');
-    var meta = await probeFile(proxyUrl);
+    var meta = await probeFile(proxyUrl, abortController.signal);
 
     // 4. 判断续传起点
     var resumeFrom = 0;
@@ -477,7 +507,7 @@ async function startDownload() {
     // 5. 创建可写流（保留已有内容，用于续传）
     writable = await fileHandle.createWritable({ keepExistingData: true });
 
-    // 6. 记录 meta（含文件句柄）
+    // 6. 记录 meta
     var metaRecord = {
       url: rawUrl,
       fileSize: meta.fileSize,
@@ -502,10 +532,8 @@ async function startDownload() {
 
       var buf = await downloadChunk(proxyUrl, i, start, end, abortController.signal);
 
-      // 写入硬盘指定偏移
       await writable.write({ type: 'write', position: start, data: buf });
 
-      // 更新 meta
       metaRecord.nextChunk = i + 1;
       metaRecord.updatedAt = Date.now();
       await idbPut(STORE_META, rawUrl, metaRecord);
