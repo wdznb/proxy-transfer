@@ -7,8 +7,8 @@ const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB 分片
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 2;
 const STORE_META = 'meta';
-const CHUNK_TIMEOUT_MS = 60000;     // 单片下载超时
-const PROBE_TIMEOUT_MS = 30000;     // 探测元信息超时
+const CHUNK_TIMEOUT_MS = 20000;     // 单片下载超时
+const PROBE_TIMEOUT_MS = 20000;     // 探测元信息超时
 const MAX_RETRIES = 3;
 
 // ==================== Worker 入口 ====================
