@@ -1,13 +1,16 @@
 /**
  * Cloudflare Worker：分段代理下载 + 流式写入硬盘 + 断点续传
  * 
- * 本轮修复：
- *   - 单请求流式模式取消 "数据长度不匹配" 校验
- *     （很多服务器 Content-Length 不准确：动态生成、被压缩、分块等）
- *   - 仅保留无限流硬上限防御，不阻塞正常下载
+ * 本轮改动：
+ *   - 移除"服务器不支持分片时自动切换到流式"的行为
+ *   - 新增手动模式选择：分段下载 / 流式下载
+ *   - 选择分段但服务器不支持 Range → 明确报错提示切换到流式
+ *   - 流式模式不保存断点续传 meta（该模式本身无法续传）
+ *   - 模式选择持久化到 localStorage
+ *   - 修复分段模式状态栏不更新的问题
  */
 
-const CHUNK_SIZE = 1024 * 1024;
+const CHUNK_SIZE = 256 * 1024;
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 3;
 const STORE_META = 'meta';
@@ -29,14 +32,14 @@ const MAX_PENDING_CHUNKS = 15;
 const MAX_PENDING_BYTES = 40 * 1024 * 1024;
 
 const PER_IP_FETCH_TIMEOUT_MS = 12000;
-const TOTAL_FETCH_TIMEOUT_MS = 25000;
+const TOTAL_FETCH_TIMEOUT_MS = 30000;
 const MAX_IPS_TO_TRY = 3;
 
 const DNS_INFLIGHT_TIMEOUT_MS = 10000;
 
 const IDB_BATCH_SIZE = 8;
 
-const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;  // 4GB 硬上限，防无限流
+const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;
 const SINGLE_REQUEST_SIZE_BUFFER = 4 * 1024 * 1024;
 
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -635,7 +638,7 @@ function getHTML() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>分段代理下载器（流式写盘）</title>
+<title>分段代理下载器</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; background: #f8f9fa; }
@@ -644,6 +647,10 @@ function getHTML() {
   label { display: block; font-size: .85rem; color: #555; margin-bottom: 6px; font-weight: 500; }
   input[type="text"] { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: .95rem; outline: none; }
   input[type="text"]:focus { border-color: #4a6cf7; box-shadow: 0 0 0 3px rgba(74,108,247,.12); }
+  select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: .95rem; outline: none; background: #fff; }
+  select:focus { border-color: #4a6cf7; box-shadow: 0 0 0 3px rgba(74,108,247,.12); }
+  select:disabled { opacity: .55; cursor: not-allowed; }
+  .field { margin-top: 14px; }
   .row { display: flex; gap: 10px; margin-top: 14px; }
   button { flex: 1; padding: 11px 18px; border: none; border-radius: 8px; font-size: .95rem; font-weight: 600; cursor: pointer; transition: all .15s; }
   button:disabled { opacity: .45; cursor: not-allowed; }
@@ -671,17 +678,31 @@ function getHTML() {
   .status.info { color: #4a6cf7; }
   .status.warn { color: #f59e0b; }
   .hint { font-size: .78rem; color: #888; margin-top: 8px; line-height: 1.5; }
+  .mode-hint { font-size: .78rem; color: #888; margin-top: 6px; line-height: 1.5; }
 </style>
 </head>
 <body>
-<h1>🔽 分段代理下载器（流式写盘）</h1>
+<h1>🔽 分段代理下载器</h1>
 <div class="card">
   <label for="urlInput">文件直链地址</label>
   <input type="text" id="urlInput" placeholder="https://example.com/large-file.zip" autocomplete="off">
+
+  <div class="field">
+    <label for="modeSelect">下载方式</label>
+    <select id="modeSelect">
+      <option value="segmented">分段下载（支持断点续传，需要服务器支持 Range）</option>
+      <option value="stream">流式下载（不支持断点续传，任何服务器都可用）</option>
+    </select>
+    <div class="mode-hint" id="modeHint">
+      分段下载：服务器必须支持 Range 请求（返回 206），中断后可续传。
+    </div>
+  </div>
+
   <div class="row">
     <button class="btn-primary" id="startBtn" onclick="startDownload()">开始下载</button>
     <button class="btn-danger" id="cancelBtn" onclick="cancelDownload()" disabled>取消</button>
   </div>
+
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
     <div class="progress-text">
@@ -689,10 +710,10 @@ function getHTML() {
       <span id="progressPct">0%</span>
     </div>
   </div>
+
   <div class="status" id="statusMsg"></div>
   <div class="hint">
-    提示：每下载完一片会立即写入你选择的文件。刷新页面后重新输入同一地址，会自动续传。<br>
-    若服务器不支持分段下载（不响应 Range 请求），将自动切换为单请求流式模式，此时中断后需重新下载。<br>
+    提示：每下载完一片会立即写入你选择的文件。刷新页面后重新输入同一地址，会自动续传（仅分段模式）。<br>
     安全提示：本页面会将文件句柄保存在浏览器 IndexedDB 中以实现自动续传。若在公用设备使用，请及时清理浏览器数据。
   </div>
 </div>
@@ -717,7 +738,7 @@ var SINGLE_REQUEST_SIZE_BUFFER = ${SINGLE_REQUEST_SIZE_BUFFER};
 var abortController = null;
 var isDownloading = false;
 
-// ==================== IndexedDB 单例（带重连互斥锁） ====================
+// ==================== IndexedDB 单例 ====================
 var dbPromise = null;
 var dbPendingOpen = null;
 
@@ -739,8 +760,7 @@ function openDB() {
         try { db.close(); } catch (_) {}
         dbPromise = null; dbPendingOpen = null;
       };
-      var resolved = Promise.resolve(db);
-      dbPromise = resolved;
+      dbPromise = Promise.resolve(db);
       dbPendingOpen = null;
       resolve(db);
     };
@@ -823,11 +843,7 @@ var idbChan = (typeof MessageChannel !== 'undefined') ? new MessageChannel() : n
 var idbNextBatch = null;
 if (idbChan) {
   idbChan.port1.onmessage = function () {
-    if (idbNextBatch) {
-      var fn = idbNextBatch;
-      idbNextBatch = null;
-      fn();
-    }
+    if (idbNextBatch) { var fn = idbNextBatch; idbNextBatch = null; fn(); }
   };
 }
 
@@ -842,10 +858,7 @@ function scheduleNextBatch(fn) {
 
 function queueIdbPut(storeName, key, value) {
   return new Promise(function (resolve, reject) {
-    idbPendingTasks.push({
-      storeName: storeName, key: key, value: value,
-      resolve: resolve, reject: reject,
-    });
+    idbPendingTasks.push({ storeName: storeName, key: key, value: value, resolve: resolve, reject: reject });
     drainIdbQueue();
   });
 }
@@ -857,10 +870,7 @@ function drainIdbQueue() {
 
   var runBatch = function (remaining) {
     if (idbPendingTasks.length === 0) { idbWriteInFlight = false; return; }
-    if (remaining <= 0) {
-      scheduleNextBatch(function () { runBatch(IDB_BATCH_SIZE); });
-      return;
-    }
+    if (remaining <= 0) { scheduleNextBatch(function () { runBatch(IDB_BATCH_SIZE); }); return; }
     var task = idbPendingTasks.shift();
     idbPut(task.storeName, task.key, task.value).then(
       function () { task.resolve(); runBatch(remaining - 1); },
@@ -969,7 +979,7 @@ async function probeFile(proxyUrl, outerSignal) {
       throw new Error('无法获取文件信息：' + (errText || ('HTTP ' + resp.status)));
     }
 
-    // 服务器返回 200：不支持 Range，进入单请求流式模式
+    // 服务器返回 200：不支持 Range
     if (resp.status === 200) {
       var xUnknownSize = resp.headers.get('X-Unknown-Size') === '1';
       var upCl = resp.headers.get('X-Upstream-Content-Length');
@@ -1008,7 +1018,6 @@ async function probeFile(proxyUrl, outerSignal) {
           releaseBody(resp);
           return {
             fileSize: 0, totalChunks: 1, singleRequest: true, unknownSize: true,
-            streamFallback: true,
             contentType: contentType2, etag: etag2, lastModified: lastModified2, fileName: fileName2,
           };
         }
@@ -1019,7 +1028,6 @@ async function probeFile(proxyUrl, outerSignal) {
       releaseBody(resp);
       return {
         fileSize: cl, totalChunks: 1, singleRequest: true, unknownSize: false,
-        streamFallback: cl > CHUNK_SIZE,
         contentType: contentType2, etag: etag2, lastModified: lastModified2, fileName: fileName2,
       };
     }
@@ -1083,7 +1091,6 @@ async function probeFile(proxyUrl, outerSignal) {
     return {
       fileSize: fileSize, totalChunks: Math.ceil(fileSize / CHUNK_SIZE),
       singleRequest: false, unknownSize: false,
-      streamFallback: false,
       contentType: contentType, etag: etag, lastModified: lastModified, fileName: fileName
     };
   } catch (e) {
@@ -1138,7 +1145,7 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal) {
   }
 }
 
-// ==================== 单请求流式下载（不再校验长度） ====================
+// ==================== 单请求流式下载 ====================
 async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, outerSignal, onProgress) {
   var knownSize = fileSize > 0;
   var maxAllowedBytes = knownSize
@@ -1156,7 +1163,7 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
       try { errText = await resp.text(); } catch (_) {}
       throw new Error(errText || ('HTTP ' + resp.status));
     }
-    if (resp.status !== 200) throw new Error('单请求模式期望 200，实际 ' + resp.status);
+    if (resp.status !== 200) throw new Error('流式下载模式期望 200，实际 ' + resp.status);
 
     if (!resp.body) {
       var buf = await resp.arrayBuffer();
@@ -1192,7 +1199,6 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
         onProgress(totalRead, fileSize);
       }
     }
-
   } finally {
     outerSignal.removeEventListener('abort', onOuterAbort);
   }
@@ -1326,6 +1332,21 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
   });
 }
 
+// ==================== 模式选择 UI ====================
+function getDownloadMode() {
+  return $('modeSelect').value;
+}
+
+function updateModeHint() {
+  var mode = getDownloadMode();
+  var hint = $('modeHint');
+  if (mode === 'segmented') {
+    hint.textContent = '分段下载：服务器必须支持 Range 请求（返回 206），中断后可续传。';
+  } else {
+    hint.textContent = '流式下载：单次请求获取完整内容，任何服务器都可用，但中断后无法续传。';
+  }
+}
+
 // ==================== 开始下载 ====================
 async function startDownload() {
   if (isDownloading) { setStatus('已有下载任务进行中', 'err'); return; }
@@ -1338,9 +1359,13 @@ async function startDownload() {
     return;
   }
 
+  var downloadMode = getDownloadMode();
+  var modeLabel = downloadMode === 'segmented' ? '分段模式' : '流式模式';
+
   isDownloading = true;
   $('startBtn').disabled = true;
   $('cancelBtn').disabled = false;
+  $('modeSelect').disabled = true;
   $('progressWrap').classList.add('active');
 
   abortController = new AbortController();
@@ -1394,89 +1419,101 @@ async function startDownload() {
     setStatus('正在探测文件信息…', 'info');
     var meta = await probeFile(proxyUrl, abortController.signal);
 
-    var resumeFrom = 0;
-    if (existingMeta) {
-      var oldSingle = !!existingMeta.singleRequest;
-      var newSingle = !!meta.singleRequest;
-
-      if (newSingle) {
-        if (oldSingle) setStatus('该文件为单请求模式（服务器不支持 Range），无法续传，将重新下载', 'warn');
-        else setStatus('服务器行为变化（分段→单请求），将从头上传', 'warn');
-        await idbDelete(STORE_META, rawUrl);
-        existingMeta = null;
-        resumeFrom = 0;
-      } else if (oldSingle) {
-        setStatus('服务器行为变化（单请求→分段），将从头上传', 'warn');
-        await idbDelete(STORE_META, rawUrl);
-        existingMeta = null;
-        resumeFrom = 0;
-      } else {
-        var sameSize = existingMeta.fileSize === meta.fileSize;
-        var oldHasEtag = !!existingMeta.etag;
-        var newHasEtag = !!meta.etag;
-        var oldHasLm = !!existingMeta.lastModified;
-        var newHasLm = !!meta.lastModified;
-        var etagStateChanged = (oldHasEtag !== newHasEtag);
-        var lmStateChanged = (oldHasLm !== newHasLm);
-        var etagMatch = oldHasEtag && newHasEtag && existingMeta.etag === meta.etag;
-        var lmMatch = oldHasLm && newHasLm && existingMeta.lastModified === meta.lastModified;
-        var hasAnyValidator = (newHasEtag || newHasLm);
-
-        if (!sameSize) { setStatus('文件大小已变化，从头开始下载', 'info'); resumeFrom = 0; }
-        else if (!hasAnyValidator || etagStateChanged || lmStateChanged) {
-          setStatus('服务器验证器状态不一致，无法安全续传，将从头上传', 'info'); resumeFrom = 0;
-        } else if (!newHasEtag && newHasLm) {
-          setStatus('服务器仅提供 Last-Modified 弱验证器，为防止文件损坏，将从头上传', 'warn'); resumeFrom = 0;
-        } else if (etagMatch && lmMatch) {
-          resumeFrom = existingMeta.nextChunk || 0;
-          if (resumeFrom > 0) {
-            setStatus('续传：从第 ' + (resumeFrom + 1) + '/' + meta.totalChunks + ' 片开始（已写入 '
-              + formatBytes(resumeFrom * CHUNK_SIZE) + '）', 'info');
-          }
-        } else { setStatus('文件已变化，从头开始下载', 'info'); resumeFrom = 0; }
-      }
+    // ============ 模式与服务器能力校验 ============
+    if (downloadMode === 'segmented' && meta.singleRequest) {
+      // 用户选择分段，但服务器不支持 Range
+      throw new Error('服务器不支持分段下载（未响应 Range 请求）。请手动切换为"流式下载"模式后重试。');
     }
 
+    // 创建可写流
     writable = await fileHandle.createWritable({ keepExistingData: true });
     safeWriter = makeSafeWriter(writable);
 
-    metaRecord = {
-      url: rawUrl, fileSize: meta.fileSize, totalChunks: meta.totalChunks,
-      etag: meta.etag, lastModified: meta.lastModified, fileName: meta.fileName,
-      contentType: meta.contentType, nextChunk: resumeFrom,
-      singleRequest: !!meta.singleRequest, fileHandle: fileHandle, updatedAt: Date.now(),
-    };
-    lastConfirmedChunk = resumeFrom;
-    await idbPut(STORE_META, rawUrl, metaRecord);
-    updateProgress(Math.min(resumeFrom * CHUNK_SIZE, meta.fileSize), meta.fileSize);
+    if (downloadMode === 'stream') {
+      // ==================== 流式模式 ====================
+      // 流式无法续传，清除任何遗留的分段 meta
+      try { await idbDelete(STORE_META, rawUrl); } catch (_) {}
+      existingMeta = null;
 
-    if (meta.singleRequest) {
+      // 更新状态文字
       if (meta.unknownSize) {
-        setStatus('⚠️ 服务器不支持分段下载，已自动切换为单请求流式模式（大小未知，中断后需重新下载）', 'warn');
-      } else if (meta.streamFallback) {
-        setStatus('⚠️ 服务器不支持分段下载，已自动切换为单请求流式模式（'
-          + formatBytes(meta.fileSize) + '，中断后无法续传）', 'warn');
+        setStatus('正在下载（流式模式，总大小未知）…', 'info');
       } else {
-        setStatus('服务器不支持分段下载，已自动切换为单请求流式模式（'
-          + formatBytes(meta.fileSize) + '）', 'info');
+        setStatus('正在下载（流式模式，' + formatBytes(meta.fileSize) + '）…', 'info');
       }
 
       await downloadSingleRequestStreaming(
         proxyUrl, meta.fileSize, safeWriter, abortController.signal,
         function (bytesRead, fileSize) {
-          lastConfirmedChunk = 1;
           updateProgress(bytesRead, fileSize);
         });
     } else {
+      // ==================== 分段模式 ====================
+      var resumeFrom = 0;
+      if (existingMeta) {
+        // 校验新旧 meta 的一致性
+        var oldSingle = !!existingMeta.singleRequest;
+        if (oldSingle) {
+          // 旧记录是流式模式（理论上不会出现，因为流式不保存 meta），删除并重新开始
+          await idbDelete(STORE_META, rawUrl);
+          existingMeta = null;
+        } else {
+          // 分段 → 分段，运行标准续传校验
+          var sameSize = existingMeta.fileSize === meta.fileSize;
+          var oldHasEtag = !!existingMeta.etag;
+          var newHasEtag = !!meta.etag;
+          var oldHasLm = !!existingMeta.lastModified;
+          var newHasLm = !!meta.lastModified;
+          var etagStateChanged = (oldHasEtag !== newHasEtag);
+          var lmStateChanged = (oldHasLm !== newHasLm);
+          var etagMatch = oldHasEtag && newHasEtag && existingMeta.etag === meta.etag;
+          var lmMatch = oldHasLm && newHasLm && existingMeta.lastModified === meta.lastModified;
+          var hasAnyValidator = (newHasEtag || newHasLm);
+
+          if (!sameSize) {
+            setStatus('文件大小已变化，从头开始下载', 'info');
+            resumeFrom = 0;
+          } else if (!hasAnyValidator || etagStateChanged || lmStateChanged) {
+            setStatus('服务器验证器状态不一致，无法安全续传，将从头上传', 'info');
+            resumeFrom = 0;
+          } else if (!newHasEtag && newHasLm) {
+            setStatus('服务器仅提供 Last-Modified 弱验证器，为防止文件损坏，将从头上传', 'warn');
+            resumeFrom = 0;
+          } else if (etagMatch && lmMatch) {
+            resumeFrom = existingMeta.nextChunk || 0;
+          } else {
+            setStatus('文件已变化，从头开始下载', 'info');
+            resumeFrom = 0;
+          }
+        }
+      }
+
+      // 保存 meta
+      metaRecord = {
+        url: rawUrl, fileSize: meta.fileSize, totalChunks: meta.totalChunks,
+        etag: meta.etag, lastModified: meta.lastModified, fileName: meta.fileName,
+        contentType: meta.contentType, nextChunk: resumeFrom,
+        singleRequest: false, fileHandle: fileHandle, updatedAt: Date.now(),
+      };
+      lastConfirmedChunk = resumeFrom;
+      await idbPut(STORE_META, rawUrl, metaRecord);
+      updateProgress(Math.min(resumeFrom * CHUNK_SIZE, meta.fileSize), meta.fileSize);
+
+      // ★ 修复：进入分段下载前明确更新状态文字
+      if (resumeFrom > 0) {
+        setStatus('正在续传（从第 ' + (resumeFrom + 1) + '/' + meta.totalChunks + ' 片开始，已写入 '
+          + formatBytes(resumeFrom * CHUNK_SIZE) + '）…', 'info');
+      } else {
+        setStatus('正在下载（分段模式，共 ' + meta.totalChunks + ' 片）…', 'info');
+      }
+
       await downloadAllChunks(
         proxyUrl, meta, resumeFrom, safeWriter, abortController.signal,
         function (nextChunk, total) {
           lastConfirmedChunk = nextChunk;
           var downloaded = Math.min(nextChunk * CHUNK_SIZE, meta.fileSize);
           updateProgress(downloaded, meta.fileSize);
-          if (nextChunk < total) {
-            setStatus('正在下载（分段模式，已完成 ' + nextChunk + '/' + total + ' 片）…', 'info');
-          }
+
           metaRecord.nextChunk = nextChunk;
           chunksSinceFlush++;
           var now = Date.now();
@@ -1488,7 +1525,7 @@ async function startDownload() {
               url: rawUrl, fileSize: meta.fileSize, totalChunks: meta.totalChunks,
               etag: meta.etag, lastModified: meta.lastModified, fileName: meta.fileName,
               contentType: meta.contentType, nextChunk: nextChunk,
-              singleRequest: !!meta.singleRequest, fileHandle: fileHandle, updatedAt: now,
+              singleRequest: false, fileHandle: fileHandle, updatedAt: now,
             };
             queueIdbPut(STORE_META, rawUrl, snapshot).catch(function (err) {
               console.warn('IndexedDB 写入失败:', err);
@@ -1500,6 +1537,7 @@ async function startDownload() {
         });
     }
 
+    // 关闭写入流
     if (safeWriter.isBroken()) {
       writableClosed = true;
       try { await writable.abort(); } catch (_) {}
@@ -1515,11 +1553,14 @@ async function startDownload() {
       throw new Error('文件保存失败（可能磁盘已满或设备断开）：' + closeMsg);
     }
 
-    await idbDelete(STORE_META, rawUrl);
-    metaRecord = null;
+    // 分段模式完成后清理 meta（流式模式没有 meta）
+    if (downloadMode === 'segmented') {
+      await idbDelete(STORE_META, rawUrl);
+      metaRecord = null;
+    }
 
     var doneSizeText = meta.fileSize > 0 ? formatBytes(meta.fileSize) : '大小未知';
-    setStatus('✅ 下载完成：' + meta.fileName + '（' + doneSizeText + '）', 'ok');
+    setStatus('✅ 下载完成（' + modeLabel + '）：' + meta.fileName + '（' + doneSizeText + '）', 'ok');
     if (meta.fileSize > 0) {
       updateProgress(meta.fileSize, meta.fileSize);
     } else {
@@ -1530,6 +1571,7 @@ async function startDownload() {
     }
   } catch (e) {
     try { await waitIdbQueue(); } catch (_) {}
+
     var isCloseFailure = e && e.message && (
       e.message.indexOf('文件保存失败') !== -1 ||
       e.message.indexOf('文件句柄已损坏') !== -1);
@@ -1538,16 +1580,22 @@ async function startDownload() {
       metaRecord = null;
       setStatus('❌ ' + e.message, 'err');
     } else {
-      if (metaRecord && !metaRecord.singleRequest) {
+      // 分段模式在异常时保存进度；流式模式不保存
+      if (metaRecord && downloadMode === 'segmented') {
         metaRecord.nextChunk = lastConfirmedChunk;
         try { metaRecord.updatedAt = Date.now(); await idbPut(STORE_META, rawUrl, metaRecord); } catch (_) {}
-      } else if (metaRecord && metaRecord.singleRequest) {
-        try { await idbDelete(STORE_META, rawUrl); } catch (_) {}
       }
+
       if (abortController && abortController.signal.aborted) {
-        setStatus('下载已取消' + (metaRecord && !metaRecord.singleRequest ? '（进度已保存，可续传）' : '（单请求模式需重新下载）'), 'err');
+        var cancelMsg = '下载已取消';
+        if (downloadMode === 'segmented') cancelMsg += '（进度已保存，可续传）';
+        else cancelMsg += '（流式模式需重新下载）';
+        setStatus(cancelMsg, 'err');
       } else if (e && e.message === 'ABORTED') {
-        setStatus('下载已取消' + (metaRecord && !metaRecord.singleRequest ? '（进度已保存，可续传）' : '（单请求模式需重新下载）'), 'err');
+        var cancelMsg2 = '下载已取消';
+        if (downloadMode === 'segmented') cancelMsg2 += '（进度已保存，可续传）';
+        else cancelMsg2 += '（流式模式需重新下载）';
+        setStatus(cancelMsg2, 'err');
       } else {
         setStatus('❌ ' + (e && e.message ? e.message : String(e)), 'err');
       }
@@ -1569,13 +1617,29 @@ async function startDownload() {
     isDownloading = false;
     $('startBtn').disabled = false;
     $('cancelBtn').disabled = true;
+    $('modeSelect').disabled = false;
     abortController = null;
   }
 }
 
 function cancelDownload() { if (abortController) abortController.abort(); }
 
+// ==================== 页面加载 ====================
 window.addEventListener('DOMContentLoaded', async function () {
+  // 恢复用户上次选择的模式
+  try {
+    var savedMode = localStorage.getItem('cf_dl_mode');
+    if (savedMode === 'stream' || savedMode === 'segmented') {
+      $('modeSelect').value = savedMode;
+    }
+  } catch (_) {}
+  updateModeHint();
+
+  $('modeSelect').addEventListener('change', function () {
+    try { localStorage.setItem('cf_dl_mode', this.value); } catch (_) {}
+    updateModeHint();
+  });
+
   try {
     try { await idbCleanupStale(STALE_AGE_MS); } catch (_) {}
     var metas = await idbGetAll(STORE_META);
@@ -1586,6 +1650,14 @@ window.addEventListener('DOMContentLoaded', async function () {
       pending.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
       var latest = pending[0];
       $('urlInput').value = latest.url;
+      // 有未完成记录时，默认切回分段模式以便续传
+      try {
+        if ($('modeSelect').value !== 'segmented') {
+          $('modeSelect').value = 'segmented';
+          localStorage.setItem('cf_dl_mode', 'segmented');
+          updateModeHint();
+        }
+      } catch (_) {}
       setStatus('检测到未完成的下载（' + latest.fileName + '，已下载 '
         + latest.nextChunk + '/' + latest.totalChunks + ' 片），点击"开始下载"继续', 'info');
     }
