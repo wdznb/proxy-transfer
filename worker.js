@@ -40,7 +40,7 @@ const DNS_INFLIGHT_TIMEOUT_MS = 10000;
 const IDB_BATCH_SIZE = 8;
 
 const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;
-const SINGLE_REQUEST_SIZE_BUFFER = 4 * 1024 * 1024;
+const SINGLE_REQUEST_SIZE_BUFFER = CHUNK_SIZE;
 
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -1202,6 +1202,18 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
   } finally {
     outerSignal.removeEventListener('abort', onOuterAbort);
   }
+   // ★ 新增：检测流是否提前结束
+  if (knownSize && totalRead < fileSize) {
+    var gotMB = (totalRead / 1024 / 1024).toFixed(1);
+    var expMB = (fileSize / 1024 / 1024).toFixed(1);
+    if (totalRead < fileSize * 0.99) {
+      // 明显提前结束，给用户警告但不抛错
+      streamTruncatedWarning = {
+        gotBytes: totalRead,
+        expectedBytes: fileSize,
+      };
+    }
+  }
 }
 
 // ==================== 并发下载 + 顺序写入 ====================
@@ -1349,6 +1361,8 @@ function updateModeHint() {
 
 // ==================== 开始下载 ====================
 async function startDownload() {
+  var streamTruncatedWarning = null;
+  var pendingStreamWarning = null;
   if (isDownloading) { setStatus('已有下载任务进行中', 'err'); return; }
   var rawUrl = $('urlInput').value.trim();
   if (!rawUrl) { setStatus('请输入文件地址', 'err'); return; }
@@ -1447,6 +1461,15 @@ async function startDownload() {
         function (bytesRead, fileSize) {
           updateProgress(bytesRead, fileSize);
         });
+        // ★ 检查是否被提前截断
+      if (typeof streamTruncatedWarning !== 'undefined' && streamTruncatedWarning) {
+        var gotMB = (streamTruncatedWarning.gotBytes / 1024 / 1024).toFixed(1);
+        var expMB = (streamTruncatedWarning.expectedBytes / 1024 / 1024).toFixed(1);
+        // 完成后仍会 close，但状态栏给出警告
+        pendingStreamWarning = '⚠️ 下载已结束，但仅收到 ' + gotMB + 'MB（预期 ' + expMB + 'MB）。'
+          + '这通常是 Cloudflare Worker 对单次流式连接约 30 秒的时间限制导致。'
+          + '1GB+ 的文件请改用"分段下载"模式。';
+      }
     } else {
       // ==================== 分段模式 ====================
       var resumeFrom = 0;
@@ -1560,7 +1583,12 @@ async function startDownload() {
     }
 
     var doneSizeText = meta.fileSize > 0 ? formatBytes(meta.fileSize) : '大小未知';
-    setStatus('✅ 下载完成（' + modeLabel + '）：' + meta.fileName + '（' + doneSizeText + '）', 'ok');
+    if (typeof pendingStreamWarning !== 'undefined' && pendingStreamWarning) {
+      setStatus(pendingStreamWarning, 'warn');
+      pendingStreamWarning = null;
+    } else {
+      setStatus('✅ 下载完成（' + modeLabel + '）：' + meta.fileName + '（' + doneSizeText + '）', 'ok');
+    }
     if (meta.fileSize > 0) {
       updateProgress(meta.fileSize, meta.fileSize);
     } else {
