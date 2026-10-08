@@ -1102,41 +1102,84 @@ async function probeFile(proxyUrl, outerSignal) {
   }
 }
 
-async function downloadChunk(proxyUrl, index, start, end, outerSignal) {
+async function downloadChunk(proxyUrl, index, start, end, outerSignal, alreadyDownloadedAny) {
   var expectedLen = end - start + 1;
   var attempt = 0;
+  var got200Count = 0;
+  var MAX_200_RETRIES = 3;
+
   while (true) {
     var ctrl = new AbortController();
     var timedOut = false;
     var timer = setTimeout(function () { timedOut = true; ctrl.abort(); }, CHUNK_TIMEOUT_MS);
     var onOuterAbort = function () { ctrl.abort(); };
     outerSignal.addEventListener('abort', onOuterAbort, { once: true });
+
     try {
       var resp = await fetch(proxyUrl, {
         headers: { 'Range': 'bytes=' + start + '-' + end },
         signal: ctrl.signal, cache: 'no-store', credentials: 'same-origin',
       });
+
       if (!resp.ok) {
         var errText = '';
         try { errText = await resp.text(); } catch (_) {}
         throw new Error(errText || ('HTTP ' + resp.status));
       }
+
       if (resp.status !== 206) {
-        throw new Error('目标服务器不支持分段下载（返回 ' + resp.status + ' 而非 206），已终止');
+        // 释放 body 防止连接泄漏
+        try {
+          if (resp.body && typeof resp.body.cancel === 'function') {
+            var p = resp.body.cancel();
+            if (p && typeof p.catch === 'function') p.catch(function () {});
+          }
+        } catch (_) {}
+
+        // 已经下载过其他分片 → 服务器整体支持 Range，这次是偶发
+        if (alreadyDownloadedAny) {
+          got200Count++;
+          if (got200Count >= MAX_200_RETRIES) {
+            throw new Error('FATAL_RANGE:第 ' + (index + 1) + ' 片连续 ' + MAX_200_RETRIES
+              + ' 次返回 ' + resp.status + '。可能是 CDN 边缘节点不一致或服务端限流。'
+              + '请稍后重试，或将 CHUNK_SIZE 调大（如 1MB / 2MB）以减少请求数。');
+          }
+          setStatus('第 ' + (index + 1) + ' 片返回 ' + resp.status + '（偶发），等待重试 '
+            + got200Count + '/' + MAX_200_RETRIES + '…', 'warn');
+          // 消耗定时器和监听器后进入下一轮
+          clearTimeout(timer);
+          outerSignal.removeEventListener('abort', onOuterAbort);
+          // 加随机延迟，让 CDN 可能路由到其他节点
+          await new Promise(function (r) { setTimeout(r, 1500 + Math.random() * 1500); });
+          continue;
+        }
+
+        // 首次请求就返回 200 → 服务器真的不支持 Range
+        throw new Error('FATAL_RANGE:目标服务器不支持分段下载（返回 ' + resp.status + ' 而非 206）。'
+          + '请切换为"流式下载"模式（仅适合 < 100MB 文件）。');
       }
+
       var buf = await resp.arrayBuffer();
       if (buf.byteLength === 0) throw new Error('空响应');
-      if (buf.byteLength !== expectedLen) throw new Error('分片长度不匹配：期望 ' + expectedLen + '，实际 ' + buf.byteLength);
+      if (buf.byteLength !== expectedLen) {
+        throw new Error('分片长度不匹配：期望 ' + expectedLen + '，实际 ' + buf.byteLength);
+      }
       return buf;
     } catch (e) {
       if (outerSignal.aborted) throw e;
+
+      // FATAL_RANGE 前缀的错误直接抛出，不重试
+      if (e.message && e.message.indexOf('FATAL_RANGE:') === 0) {
+        throw new Error(e.message.slice(12));
+      }
+
       attempt++;
-      if (e.message && e.message.indexOf('不支持分段下载') !== -1) throw e;
       if (attempt >= MAX_RETRIES) {
         var reason = timedOut ? '超时' : (e && e.message ? e.message : String(e));
         throw new Error('第 ' + (index + 1) + ' 片下载失败：' + reason);
       }
-      setStatus('第 ' + (index + 1) + ' 片' + (timedOut ? '超时' : '失败') + '，重试 ' + attempt + '/' + MAX_RETRIES + '…', 'info');
+      setStatus('第 ' + (index + 1) + ' 片' + (timedOut ? '超时' : '失败') + '，重试 '
+        + attempt + '/' + MAX_RETRIES + '…', 'info');
       await new Promise(function (r) { setTimeout(r, 1000 * attempt); });
     } finally {
       clearTimeout(timer);
@@ -1234,7 +1277,7 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
     var writeFailed = false;
     var writeTasks = [];
     var writeRunning = false;
-
+    var successfulChunks = resumeFrom;   // ★ 新增：用于判断是否已经成功下载过任何分片
     function allWorkDone() {
       return inFlight === 0 && nextIdx >= total && pending.size === 0 &&
              writeTasks.length === 0 && !writeRunning;
@@ -1303,9 +1346,12 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
       var start = idx * CHUNK_SIZE;
       var end = Math.min(start + CHUNK_SIZE - 1, meta.fileSize - 1);
       inFlight++;
-      downloadChunk(proxyUrl, idx, start, end, outerSignal)
+      // ★ 传第四个参数：是否已经成功下载过其他分片
+      var alreadyDownloadedAny = successfulChunks > 0;
+      downloadChunk(proxyUrl, idx, start, end, outerSignal, alreadyDownloadedAny)
         .then(function (buf) {
           inFlight--;
+          successfulChunks++;  // ★ 计数递增
           if (finished) return;
           pending.set(idx, buf);
           pendingBytes += buf.byteLength;
