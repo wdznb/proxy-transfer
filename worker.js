@@ -7,7 +7,7 @@
  *   - 仅保留无限流硬上限防御，不阻塞正常下载
  */
 
-const CHUNK_SIZE = 256 * 1024;
+const CHUNK_SIZE = 1024 * 1024;
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 3;
 const STORE_META = 'meta';
@@ -1139,9 +1139,6 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal) {
 }
 
 // ==================== 单请求流式下载（不再校验长度） ====================
-// ★ 修复：移除 totalRead !== fileSize 的校验
-//   - 服务器可能返回动态内容、Content-Length 不准确、压缩传输后长度不符
-//   - 只保留硬上限（防无限流），不因长度差异判定失败
 async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, outerSignal, onProgress) {
   var knownSize = fileSize > 0;
   var maxAllowedBytes = knownSize
@@ -1162,9 +1159,7 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
     if (resp.status !== 200) throw new Error('单请求模式期望 200，实际 ' + resp.status);
 
     if (!resp.body) {
-      // 极老浏览器降级：arrayBuffer 一次性读取
       var buf = await resp.arrayBuffer();
-      // ★ 移除长度校验，只保留硬上限
       if (buf.byteLength > maxAllowedBytes) {
         throw new Error('单请求响应超过上限 ' + formatBytes(maxAllowedBytes) + '，疑似恶意源站');
       }
@@ -1187,7 +1182,6 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
       var chunk = result.value;
       if (chunk && chunk.byteLength > 0) {
         totalRead += chunk.byteLength;
-        // ★ 仅保留硬上限防御，不校验与 Content-Length 是否一致
         if (totalRead > maxAllowedBytes) {
           try { await reader.cancel(); } catch (_) {}
           throw new Error('单请求响应超过上限 ' + formatBytes(maxAllowedBytes) + '（实际已收到 '
@@ -1199,12 +1193,6 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
       }
     }
 
-    // ★ 已移除 "if (knownSize && totalRead !== fileSize) throw ..." 校验
-    //   实际下载字节数可能因以下原因与声明值不同：
-    //   1. 服务器动态生成内容，Content-Length 只是估计值
-    //   2. 上游返回压缩流但未声明或声明错误
-    //   3. CDN 边缘节点返回的内容与源站有细微差异
-    //   强行校验会导致正常文件被判为失败
   } finally {
     outerSignal.removeEventListener('abort', onOuterAbort);
   }
@@ -1480,11 +1468,6 @@ async function startDownload() {
           updateProgress(bytesRead, fileSize);
         });
     } else {
-      if (resumeFrom > 0) {
-        setStatus('正在续传（从第 ' + (resumeFrom + 1) + '/' + meta.totalChunks + ' 片开始）…', 'info');
-      } else {
-        setStatus('正在下载（分段模式，共 ' + meta.totalChunks + ' 片）…', 'info');
-      }
       await downloadAllChunks(
         proxyUrl, meta, resumeFrom, safeWriter, abortController.signal,
         function (nextChunk, total) {
@@ -1492,7 +1475,7 @@ async function startDownload() {
           var downloaded = Math.min(nextChunk * CHUNK_SIZE, meta.fileSize);
           updateProgress(downloaded, meta.fileSize);
           if (nextChunk < total) {
-            setStatus('正在下载（已完成 ' + nextChunk + '/' + total + ' 片）…', 'info');
+            setStatus('正在下载（分段模式，已完成 ' + nextChunk + '/' + total + ' 片）…', 'info');
           }
           metaRecord.nextChunk = nextChunk;
           chunksSinceFlush++;
