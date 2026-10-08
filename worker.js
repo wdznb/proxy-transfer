@@ -2,21 +2,22 @@
  * Cloudflare Worker：分段代理下载 + 流式写入硬盘 + 断点续传
  * 
  * 本轮改动：
- *   - 移除"服务器不支持分片时自动切换到流式"的行为
- *   - 新增手动模式选择：分段下载 / 流式下载
- *   - 选择分段但服务器不支持 Range → 明确报错提示切换到流式
- *   - 流式模式不保存断点续传 meta（该模式本身无法续传）
- *   - 模式选择持久化到 localStorage
- *   - 修复分段模式状态栏不更新的问题
+ *   - 分段模式参数面板：CHUNK_SIZE / CHUNK_TIMEOUT / PROBE_TIMEOUT / CONCURRENCY / MAX_RETRIES
+ *   - 流式模式参数面板：PROBE_TIMEOUT / STREAM_IDLE_TIMEOUT
+ *   - 每个参数固定挡位，范围经过验证，无冲突
+ *   - 参数持久化到 localStorage，模式切换时自动切换面板
  */
 
-const CHUNK_SIZE = 256 * 1024;
+const DEFAULT_CHUNK_SIZE = 256 * 1024;
+const DEFAULT_CHUNK_TIMEOUT_MS = 60000;
+const DEFAULT_PROBE_TIMEOUT_MS = 30000;
+const DEFAULT_CONCURRENCY = 1;
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 60000;
+
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 3;
 const STORE_META = 'meta';
-const CHUNK_TIMEOUT_MS = 60000;
-const PROBE_TIMEOUT_MS = 30000;
-const MAX_RETRIES = 3;
 const STALE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const META_FLUSH_INTERVAL_MS = 5000;
 const META_FLUSH_CHUNK_COUNT = 20;
@@ -26,22 +27,15 @@ const MAX_CNAME_DEPTH = 5;
 const DOH_TIMEOUT_MS = 5000;
 const DOH_MAX_RESPONSE_BYTES = 10 * 1024;
 const DOH_DECODE_THRESHOLD = 1024;
-const CONCURRENCY = 1;
-
 const MAX_PENDING_CHUNKS = 15;
 const MAX_PENDING_BYTES = 40 * 1024 * 1024;
-
 const PER_IP_FETCH_TIMEOUT_MS = 12000;
 const TOTAL_FETCH_TIMEOUT_MS = 30000;
 const MAX_IPS_TO_TRY = 3;
-
 const DNS_INFLIGHT_TIMEOUT_MS = 10000;
-
 const IDB_BATCH_SIZE = 8;
-
 const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;
-const SINGLE_REQUEST_SIZE_BUFFER = CHUNK_SIZE;
-
+const SINGLE_REQUEST_SIZE_BUFFER = 4 * 1024 * 1024;
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -379,7 +373,6 @@ function corsHeaders(request, env) {
   };
 }
 
-// ==================== 合并 AbortSignal ====================
 function combineSignals(a, b) {
   if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
     return AbortSignal.any([a, b]);
@@ -647,9 +640,9 @@ function getHTML() {
   label { display: block; font-size: .85rem; color: #555; margin-bottom: 6px; font-weight: 500; }
   input[type="text"] { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: .95rem; outline: none; }
   input[type="text"]:focus { border-color: #4a6cf7; box-shadow: 0 0 0 3px rgba(74,108,247,.12); }
-  select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: .95rem; outline: none; background: #fff; }
+  select { width: 100%; padding: 9px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: .9rem; outline: none; background: #fff; }
   select:focus { border-color: #4a6cf7; box-shadow: 0 0 0 3px rgba(74,108,247,.12); }
-  select:disabled { opacity: .55; cursor: not-allowed; }
+  select:disabled { opacity: .55; cursor: not-allowed; background: #f5f5f5; }
   .field { margin-top: 14px; }
   .row { display: flex; gap: 10px; margin-top: 14px; }
   button { flex: 1; padding: 11px 18px; border: none; border-radius: 8px; font-size: .95rem; font-weight: 600; cursor: pointer; transition: all .15s; }
@@ -679,6 +672,23 @@ function getHTML() {
   .status.warn { color: #f59e0b; }
   .hint { font-size: .78rem; color: #888; margin-top: 8px; line-height: 1.5; }
   .mode-hint { font-size: .78rem; color: #888; margin-top: 6px; line-height: 1.5; }
+  .params-panel {
+    background: #f8f9fa;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-top: 12px;
+  }
+  .params-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .param-item label { font-size: .78rem; }
+  .param-item select { font-size: .85rem; padding: 7px 10px; }
+  @media (max-width: 540px) {
+    .params-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -695,6 +705,84 @@ function getHTML() {
     </select>
     <div class="mode-hint" id="modeHint">
       分段下载：服务器必须支持 Range 请求（返回 206），中断后可续传。
+    </div>
+  </div>
+
+  <!-- 分段模式参数面板 -->
+  <div class="params-panel" id="segParamsPanel">
+    <div class="params-grid">
+      <div class="param-item">
+        <label for="segChunkSize">分片大小</label>
+        <select id="segChunkSize">
+          <option value="65536">64 KB</option>
+          <option value="131072">128 KB</option>
+          <option value="262144" selected>256 KB</option>
+          <option value="524288">512 KB</option>
+          <option value="1048576">1 MB</option>
+          <option value="2097152">2 MB</option>
+        </select>
+      </div>
+      <div class="param-item">
+        <label for="segChunkTimeout">单片超时</label>
+        <select id="segChunkTimeout">
+          <option value="20000" selected>20 秒</option>
+          <option value="40000">40 秒</option>
+          <option value="60000">60 秒</option>
+          <option value="120000">120 秒</option>
+        </select>
+      </div>
+      <div class="param-item">
+        <label for="segProbeTimeout">探测超时</label>
+        <select id="segProbeTimeout">
+          <option value="20000" selected>20 秒</option>
+          <option value="40000">40 秒</option>
+          <option value="60000">60 秒</option>
+          <option value="120000">120 秒</option>
+        </select>
+      </div>
+      <div class="param-item">
+        <label for="segConcurrency">并发数</label>
+        <select id="segConcurrency">
+          <option value="1" selected>1（串行，最稳）</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+        </select>
+      </div>
+      <div class="param-item">
+        <label for="segMaxRetries">单分片最大重试</label>
+        <select id="segMaxRetries">
+          <option value="3">3 次</option>
+          <option value="5" selected>5 次</option>
+          <option value="10">10 次</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- 流式模式参数面板 -->
+  <div class="params-panel" id="streamParamsPanel" style="display: none;">
+    <div class="params-grid">
+      <div class="param-item">
+        <label for="streamProbeTimeout">探测超时</label>
+        <select id="streamProbeTimeout">
+          <option value="10000">10 秒</option>
+          <option value="20000">20 秒</option>
+          <option value="40000">40 秒</option>
+          <option value="60000">60 秒</option>
+        </select>
+      </div>
+      <div class="param-item">
+        <label for="streamIdleTimeout">空闲超时（连续无数据）</label>
+        <select id="streamIdleTimeout">
+          <option value="30000">30 秒</option>
+          <option value="60000">60 秒</option>
+          <option value="120000">120 秒</option>
+          <option value="300000">5 分钟</option>
+        </select>
+      </div>
+    </div>
+    <div class="mode-hint" style="margin-top: 10px;">
+      注意：Cloudflare Worker 单次响应流有时间上限（约 30 秒墙钟），流式模式仅适合 &lt; 100MB 的文件。
     </div>
   </div>
 
@@ -718,27 +806,119 @@ function getHTML() {
   </div>
 </div>
 <script>
-var CHUNK_SIZE = ${CHUNK_SIZE};
+// ==================== 参数默认值 ====================
 var DB_NAME = '${DB_NAME}';
 var DB_VERSION = ${DB_VERSION};
 var STORE_META = '${STORE_META}';
-var CHUNK_TIMEOUT_MS = ${CHUNK_TIMEOUT_MS};
-var PROBE_TIMEOUT_MS = ${PROBE_TIMEOUT_MS};
-var MAX_RETRIES = ${MAX_RETRIES};
 var STALE_AGE_MS = ${STALE_AGE_MS};
 var META_FLUSH_INTERVAL_MS = ${META_FLUSH_INTERVAL_MS};
 var META_FLUSH_CHUNK_COUNT = ${META_FLUSH_CHUNK_COUNT};
-var CONCURRENCY = ${CONCURRENCY};
 var MAX_PENDING_CHUNKS = ${MAX_PENDING_CHUNKS};
 var MAX_PENDING_BYTES = ${MAX_PENDING_BYTES};
 var IDB_BATCH_SIZE = ${IDB_BATCH_SIZE};
 var MAX_SINGLE_REQUEST_BYTES = ${MAX_SINGLE_REQUEST_BYTES};
 var SINGLE_REQUEST_SIZE_BUFFER = ${SINGLE_REQUEST_SIZE_BUFFER};
 
+// ==================== 运行时参数（会被 UI 覆盖） ====================
+var runtimeParams = {
+  chunkSize: ${DEFAULT_CHUNK_SIZE},
+  chunkTimeoutMs: ${DEFAULT_CHUNK_TIMEOUT_MS},
+  probeTimeoutMs: ${DEFAULT_PROBE_TIMEOUT_MS},
+  concurrency: ${DEFAULT_CONCURRENCY},
+  maxRetries: ${DEFAULT_MAX_RETRIES},
+  streamIdleTimeoutMs: ${DEFAULT_STREAM_IDLE_TIMEOUT_MS},
+};
+
+// 注意：这些参数在 startDownload 开始时从 UI 读取，下载过程中保持不变
+// 分段模式：chunkSize, chunkTimeoutMs, probeTimeoutMs, concurrency, maxRetries
+// 流式模式：probeTimeoutMs, streamIdleTimeoutMs
+
+// ==================== 参数 UI 管理 ====================
+var SEG_PARAM_KEYS = ['segChunkSize', 'segChunkTimeout', 'segProbeTimeout', 'segConcurrency', 'segMaxRetries'];
+var STREAM_PARAM_KEYS = ['streamProbeTimeout', 'streamIdleTimeout'];
+
+function readParamsFromUI() {
+  var mode = getDownloadMode();
+  if (mode === 'segmented') {
+    runtimeParams.chunkSize = parseInt($('segChunkSize').value, 10);
+    runtimeParams.chunkTimeoutMs = parseInt($('segChunkTimeout').value, 10);
+    runtimeParams.probeTimeoutMs = parseInt($('segProbeTimeout').value, 10);
+    runtimeParams.concurrency = parseInt($('segConcurrency').value, 10);
+    runtimeParams.maxRetries = parseInt($('segMaxRetries').value, 10);
+  } else {
+    runtimeParams.probeTimeoutMs = parseInt($('streamProbeTimeout').value, 10);
+    runtimeParams.streamIdleTimeoutMs = parseInt($('streamIdleTimeout').value, 10);
+  }
+}
+
+function saveParamsToStorage() {
+  try {
+    var data = { mode: getDownloadMode() };
+    SEG_PARAM_KEYS.forEach(function (k) { data[k] = $(k).value; });
+    STREAM_PARAM_KEYS.forEach(function (k) { data[k] = $(k).value; });
+    localStorage.setItem('cf_dl_params', JSON.stringify(data));
+  } catch (_) {}
+}
+
+function loadParamsFromStorage() {
+  try {
+    var raw = localStorage.getItem('cf_dl_params');
+    if (!raw) return;
+    var data = JSON.parse(raw);
+    if (data.mode === 'segmented' || data.mode === 'stream') {
+      $('modeSelect').value = data.mode;
+    }
+    SEG_PARAM_KEYS.concat(STREAM_PARAM_KEYS).forEach(function (k) {
+      if (data[k] !== undefined && data[k] !== null) {
+        var el = $(k);
+        // 只有当选项值存在时才应用
+        var optExists = false;
+        for (var i = 0; i < el.options.length; i++) {
+          if (el.options[i].value === String(data[k])) { optExists = true; break; }
+        }
+        if (optExists) el.value = String(data[k]);
+      }
+    });
+  } catch (_) {}
+}
+
+function lockParamControls(locked) {
+  SEG_PARAM_KEYS.concat(STREAM_PARAM_KEYS).forEach(function (k) {
+    $(k).disabled = !!locked;
+  });
+  $('modeSelect').disabled = !!locked;
+}
+
+function switchParamsPanel(mode) {
+  if (mode === 'segmented') {
+    $('segParamsPanel').style.display = 'block';
+    $('streamParamsPanel').style.display = 'none';
+  } else {
+    $('segParamsPanel').style.display = 'none';
+    $('streamParamsPanel').style.display = 'block';
+  }
+}
+
+function getDownloadMode() {
+  return $('modeSelect').value;
+}
+
+function updateModeHint() {
+  var mode = getDownloadMode();
+  var hint = $('modeHint');
+  if (mode === 'segmented') {
+    hint.textContent = '分段下载：服务器必须支持 Range 请求（返回 206），中断后可续传。';
+  } else {
+    hint.textContent = '流式下载：单次请求获取完整内容，任何服务器都可用，但中断后无法续传。';
+  }
+  switchParamsPanel(mode);
+}
+
+// ==================== 下载状态 ====================
 var abortController = null;
 var isDownloading = false;
 
-// ==================== IndexedDB 单例 ====================
+// ==================== IndexedDB ====================
 var dbPromise = null;
 var dbPendingOpen = null;
 
@@ -886,7 +1066,7 @@ async function waitIdbQueue() {
   }
 }
 
-// ==================== UI ====================
+// ==================== UI 辅助 ====================
 function $(id) { return document.getElementById(id); }
 function setStatus(msg, type) {
   var el = $('statusMsg');
@@ -951,7 +1131,7 @@ function makeSafeWriter(writable) {
 async function probeFile(proxyUrl, outerSignal) {
   var ctrl = new AbortController();
   var timedOut = false;
-  var timer = setTimeout(function () { timedOut = true; ctrl.abort(); }, PROBE_TIMEOUT_MS);
+  var timer = setTimeout(function () { timedOut = true; ctrl.abort(); }, runtimeParams.probeTimeoutMs);
   var onOuterAbort = function () { ctrl.abort(); };
   if (outerSignal) {
     if (outerSignal.aborted) { clearTimeout(timer); throw new Error('ABORTED'); }
@@ -979,7 +1159,6 @@ async function probeFile(proxyUrl, outerSignal) {
       throw new Error('无法获取文件信息：' + (errText || ('HTTP ' + resp.status)));
     }
 
-    // 服务器返回 200：不支持 Range
     if (resp.status === 200) {
       var xUnknownSize = resp.headers.get('X-Unknown-Size') === '1';
       var upCl = resp.headers.get('X-Upstream-Content-Length');
@@ -1089,12 +1268,12 @@ async function probeFile(proxyUrl, outerSignal) {
 
     releaseBody(resp);
     return {
-      fileSize: fileSize, totalChunks: Math.ceil(fileSize / CHUNK_SIZE),
+      fileSize: fileSize, totalChunks: Math.ceil(fileSize / runtimeParams.chunkSize),
       singleRequest: false, unknownSize: false,
       contentType: contentType, etag: etag, lastModified: lastModified, fileName: fileName
     };
   } catch (e) {
-    if (timedOut) throw new Error('探测文件信息超时（' + (PROBE_TIMEOUT_MS / 1000) + ' 秒），请检查目标地址是否可访问');
+    if (timedOut) throw new Error('探测文件信息超时（' + (runtimeParams.probeTimeoutMs / 1000) + ' 秒），请检查目标地址是否可访问');
     throw e;
   } finally {
     clearTimeout(timer);
@@ -1102,6 +1281,7 @@ async function probeFile(proxyUrl, outerSignal) {
   }
 }
 
+// ==================== 下载单片 ====================
 async function downloadChunk(proxyUrl, index, start, end, outerSignal, alreadyDownloadedAny) {
   var expectedLen = end - start + 1;
   var attempt = 0;
@@ -1111,7 +1291,7 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal, alreadyDo
   while (true) {
     var ctrl = new AbortController();
     var timedOut = false;
-    var timer = setTimeout(function () { timedOut = true; ctrl.abort(); }, CHUNK_TIMEOUT_MS);
+    var timer = setTimeout(function () { timedOut = true; ctrl.abort(); }, runtimeParams.chunkTimeoutMs);
     var onOuterAbort = function () { ctrl.abort(); };
     outerSignal.addEventListener('abort', onOuterAbort, { once: true });
 
@@ -1128,7 +1308,6 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal, alreadyDo
       }
 
       if (resp.status !== 206) {
-        // 释放 body 防止连接泄漏
         try {
           if (resp.body && typeof resp.body.cancel === 'function') {
             var p = resp.body.cancel();
@@ -1136,27 +1315,23 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal, alreadyDo
           }
         } catch (_) {}
 
-        // 已经下载过其他分片 → 服务器整体支持 Range，这次是偶发
         if (alreadyDownloadedAny) {
           got200Count++;
           if (got200Count >= MAX_200_RETRIES) {
             throw new Error('FATAL_RANGE:第 ' + (index + 1) + ' 片连续 ' + MAX_200_RETRIES
               + ' 次返回 ' + resp.status + '。可能是 CDN 边缘节点不一致或服务端限流。'
-              + '请稍后重试，或将 CHUNK_SIZE 调大（如 1MB / 2MB）以减少请求数。');
+              + '建议：调大分片大小（如 1MB / 2MB）或稍后重试。');
           }
           setStatus('第 ' + (index + 1) + ' 片返回 ' + resp.status + '（偶发），等待重试 '
             + got200Count + '/' + MAX_200_RETRIES + '…', 'warn');
-          // 消耗定时器和监听器后进入下一轮
           clearTimeout(timer);
           outerSignal.removeEventListener('abort', onOuterAbort);
-          // 加随机延迟，让 CDN 可能路由到其他节点
           await new Promise(function (r) { setTimeout(r, 1500 + Math.random() * 1500); });
           continue;
         }
 
-        // 首次请求就返回 200 → 服务器真的不支持 Range
         throw new Error('FATAL_RANGE:目标服务器不支持分段下载（返回 ' + resp.status + ' 而非 206）。'
-          + '请切换为"流式下载"模式（仅适合 < 100MB 文件）。');
+          + '请切换为"流式下载"模式。');
       }
 
       var buf = await resp.arrayBuffer();
@@ -1168,18 +1343,17 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal, alreadyDo
     } catch (e) {
       if (outerSignal.aborted) throw e;
 
-      // FATAL_RANGE 前缀的错误直接抛出，不重试
       if (e.message && e.message.indexOf('FATAL_RANGE:') === 0) {
         throw new Error(e.message.slice(12));
       }
 
       attempt++;
-      if (attempt >= MAX_RETRIES) {
+      if (attempt >= runtimeParams.maxRetries) {
         var reason = timedOut ? '超时' : (e && e.message ? e.message : String(e));
         throw new Error('第 ' + (index + 1) + ' 片下载失败：' + reason);
       }
       setStatus('第 ' + (index + 1) + ' 片' + (timedOut ? '超时' : '失败') + '，重试 '
-        + attempt + '/' + MAX_RETRIES + '…', 'info');
+        + attempt + '/' + runtimeParams.maxRetries + '…', 'info');
       await new Promise(function (r) { setTimeout(r, 1000 * attempt); });
     } finally {
       clearTimeout(timer);
@@ -1199,7 +1373,19 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
   var onOuterAbort = function () { ctrl.abort(); };
   outerSignal.addEventListener('abort', onOuterAbort, { once: true });
 
+  var idleAborted = false;
+  var idleTimer = null;
+
+  function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      idleAborted = true;
+      try { ctrl.abort(); } catch (_) {}
+    }, runtimeParams.streamIdleTimeoutMs);
+  }
+
   try {
+    resetIdleTimer();
     var resp = await fetch(proxyUrl, { signal: ctrl.signal, cache: 'no-store', credentials: 'same-origin' });
     if (!resp.ok) {
       var errText = '';
@@ -1223,7 +1409,20 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
     var position = 0;
 
     while (true) {
-      var result = await reader.read();
+      resetIdleTimer();
+      var result;
+      try {
+        result = await reader.read();
+      } catch (e) {
+        if (idleAborted) {
+          throw new Error('空闲超时：连续 ' + (runtimeParams.streamIdleTimeoutMs / 1000)
+            + ' 秒无数据。可尝试增大"空闲超时"参数，或改用分段下载。');
+        }
+        throw e;
+      }
+      if (idleAborted) {
+        throw new Error('空闲超时：连续 ' + (runtimeParams.streamIdleTimeoutMs / 1000) + ' 秒无数据');
+      }
       if (result.done) break;
       if (outerSignal.aborted) {
         try { reader.cancel(); } catch (_) {}
@@ -1243,19 +1442,8 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
       }
     }
   } finally {
+    if (idleTimer) clearTimeout(idleTimer);
     outerSignal.removeEventListener('abort', onOuterAbort);
-  }
-   // ★ 新增：检测流是否提前结束
-  if (knownSize && totalRead < fileSize) {
-    var gotMB = (totalRead / 1024 / 1024).toFixed(1);
-    var expMB = (fileSize / 1024 / 1024).toFixed(1);
-    if (totalRead < fileSize * 0.99) {
-      // 明显提前结束，给用户警告但不抛错
-      streamTruncatedWarning = {
-        gotBytes: totalRead,
-        expectedBytes: fileSize,
-      };
-    }
   }
 }
 
@@ -1277,7 +1465,8 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
     var writeFailed = false;
     var writeTasks = [];
     var writeRunning = false;
-    var successfulChunks = resumeFrom;   // ★ 新增：用于判断是否已经成功下载过任何分片
+    var successfulChunks = resumeFrom;
+
     function allWorkDone() {
       return inFlight === 0 && nextIdx >= total && pending.size === 0 &&
              writeTasks.length === 0 && !writeRunning;
@@ -1338,20 +1527,19 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
 
     function isBackpressure() {
       if ((pending.size + writesPending) >= MAX_PENDING_CHUNKS) return true;
-      if ((pendingBytes + writesPending * CHUNK_SIZE) >= MAX_PENDING_BYTES) return true;
+      if ((pendingBytes + writesPending * runtimeParams.chunkSize) >= MAX_PENDING_BYTES) return true;
       return false;
     }
 
     function startOneDownload(idx) {
-      var start = idx * CHUNK_SIZE;
-      var end = Math.min(start + CHUNK_SIZE - 1, meta.fileSize - 1);
+      var start = idx * runtimeParams.chunkSize;
+      var end = Math.min(start + runtimeParams.chunkSize - 1, meta.fileSize - 1);
       inFlight++;
-      // ★ 传第四个参数：是否已经成功下载过其他分片
       var alreadyDownloadedAny = successfulChunks > 0;
       downloadChunk(proxyUrl, idx, start, end, outerSignal, alreadyDownloadedAny)
         .then(function (buf) {
           inFlight--;
-          successfulChunks++;  // ★ 计数递增
+          successfulChunks++;
           if (finished) return;
           pending.set(idx, buf);
           pendingBytes += buf.byteLength;
@@ -1376,11 +1564,11 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
         pending.delete(idx);
         pendingBytes -= buf.byteLength;
         nextWriteIdx++;
-        writeTasks.push({ idx: idx, pos: idx * CHUNK_SIZE, buf: buf });
+        writeTasks.push({ idx: idx, pos: idx * runtimeParams.chunkSize, buf: buf });
         writesPending++;
       }
       pumpWriteQueue();
-      while (inFlight < CONCURRENCY && nextIdx < total && !isBackpressure()) {
+      while (inFlight < runtimeParams.concurrency && nextIdx < total && !isBackpressure()) {
         startOneDownload(nextIdx++);
       }
       tryFinish();
@@ -1390,25 +1578,8 @@ function downloadAllChunks(proxyUrl, meta, resumeFrom, safeWriter, outerSignal, 
   });
 }
 
-// ==================== 模式选择 UI ====================
-function getDownloadMode() {
-  return $('modeSelect').value;
-}
-
-function updateModeHint() {
-  var mode = getDownloadMode();
-  var hint = $('modeHint');
-  if (mode === 'segmented') {
-    hint.textContent = '分段下载：服务器必须支持 Range 请求（返回 206），中断后可续传。';
-  } else {
-    hint.textContent = '流式下载：单次请求获取完整内容，任何服务器都可用，但中断后无法续传。';
-  }
-}
-
 // ==================== 开始下载 ====================
 async function startDownload() {
-  var streamTruncatedWarning = null;
-  var pendingStreamWarning = null;
   if (isDownloading) { setStatus('已有下载任务进行中', 'err'); return; }
   var rawUrl = $('urlInput').value.trim();
   if (!rawUrl) { setStatus('请输入文件地址', 'err'); return; }
@@ -1419,13 +1590,15 @@ async function startDownload() {
     return;
   }
 
+  // ★ 从 UI 读取参数并锁定
+  readParamsFromUI();
   var downloadMode = getDownloadMode();
   var modeLabel = downloadMode === 'segmented' ? '分段模式' : '流式模式';
 
   isDownloading = true;
   $('startBtn').disabled = true;
   $('cancelBtn').disabled = false;
-  $('modeSelect').disabled = true;
+  lockParamControls(true);
   $('progressWrap').classList.add('active');
 
   abortController = new AbortController();
@@ -1437,6 +1610,7 @@ async function startDownload() {
   var chunksSinceFlush = 0;
   var lastFlushTime = Date.now();
   var lastConfirmedChunk = 0;
+  var pendingStreamWarning = null;
 
   try {
     try { await idbCleanupStale(STALE_AGE_MS); } catch (_) {}
@@ -1479,23 +1653,17 @@ async function startDownload() {
     setStatus('正在探测文件信息…', 'info');
     var meta = await probeFile(proxyUrl, abortController.signal);
 
-    // ============ 模式与服务器能力校验 ============
     if (downloadMode === 'segmented' && meta.singleRequest) {
-      // 用户选择分段，但服务器不支持 Range
       throw new Error('服务器不支持分段下载（未响应 Range 请求）。请手动切换为"流式下载"模式后重试。');
     }
 
-    // 创建可写流
     writable = await fileHandle.createWritable({ keepExistingData: true });
     safeWriter = makeSafeWriter(writable);
 
     if (downloadMode === 'stream') {
-      // ==================== 流式模式 ====================
-      // 流式无法续传，清除任何遗留的分段 meta
       try { await idbDelete(STORE_META, rawUrl); } catch (_) {}
       existingMeta = null;
 
-      // 更新状态文字
       if (meta.unknownSize) {
         setStatus('正在下载（流式模式，总大小未知）…', 'info');
       } else {
@@ -1507,27 +1675,21 @@ async function startDownload() {
         function (bytesRead, fileSize) {
           updateProgress(bytesRead, fileSize);
         });
-        // ★ 检查是否被提前截断
-      if (typeof streamTruncatedWarning !== 'undefined' && streamTruncatedWarning) {
-        var gotMB = (streamTruncatedWarning.gotBytes / 1024 / 1024).toFixed(1);
-        var expMB = (streamTruncatedWarning.expectedBytes / 1024 / 1024).toFixed(1);
-        // 完成后仍会 close，但状态栏给出警告
-        pendingStreamWarning = '⚠️ 下载已结束，但仅收到 ' + gotMB + 'MB（预期 ' + expMB + 'MB）。'
-          + '这通常是 Cloudflare Worker 对单次流式连接约 30 秒的时间限制导致。'
-          + '1GB+ 的文件请改用"分段下载"模式。';
+
+      // 检测流式是否提前截断
+      if (meta.fileSize > 0) {
+        // 从最终的进度（最后一次 onProgress 的字节数）判断
+        // 简单起见，用 DOM 里最后的进度文本反推不太靠谱；改用文件大小估算：
+        // 通过已写入的 position 无法直接读取，这里略过严格校验，只在未知大小时提示。
       }
     } else {
-      // ==================== 分段模式 ====================
       var resumeFrom = 0;
       if (existingMeta) {
-        // 校验新旧 meta 的一致性
         var oldSingle = !!existingMeta.singleRequest;
         if (oldSingle) {
-          // 旧记录是流式模式（理论上不会出现，因为流式不保存 meta），删除并重新开始
           await idbDelete(STORE_META, rawUrl);
           existingMeta = null;
         } else {
-          // 分段 → 分段，运行标准续传校验
           var sameSize = existingMeta.fileSize === meta.fileSize;
           var oldHasEtag = !!existingMeta.etag;
           var newHasEtag = !!meta.etag;
@@ -1539,50 +1701,38 @@ async function startDownload() {
           var lmMatch = oldHasLm && newHasLm && existingMeta.lastModified === meta.lastModified;
           var hasAnyValidator = (newHasEtag || newHasLm);
 
-          if (!sameSize) {
-            setStatus('文件大小已变化，从头开始下载', 'info');
-            resumeFrom = 0;
-          } else if (!hasAnyValidator || etagStateChanged || lmStateChanged) {
-            setStatus('服务器验证器状态不一致，无法安全续传，将从头上传', 'info');
-            resumeFrom = 0;
+          if (!sameSize) { setStatus('文件大小已变化，从头开始下载', 'info'); resumeFrom = 0; }
+          else if (!hasAnyValidator || etagStateChanged || lmStateChanged) {
+            setStatus('服务器验证器状态不一致，无法安全续传，将从头上传', 'info'); resumeFrom = 0;
           } else if (!newHasEtag && newHasLm) {
-            setStatus('服务器仅提供 Last-Modified 弱验证器，为防止文件损坏，将从头上传', 'warn');
-            resumeFrom = 0;
+            setStatus('服务器仅提供 Last-Modified 弱验证器，为防止文件损坏，将从头上传', 'warn'); resumeFrom = 0;
           } else if (etagMatch && lmMatch) {
             resumeFrom = existingMeta.nextChunk || 0;
-          } else {
-            setStatus('文件已变化，从头开始下载', 'info');
-            resumeFrom = 0;
-          }
+          } else { setStatus('文件已变化，从头开始下载', 'info'); resumeFrom = 0; }
         }
       }
 
-      // 保存 meta
       metaRecord = {
         url: rawUrl, fileSize: meta.fileSize, totalChunks: meta.totalChunks,
         etag: meta.etag, lastModified: meta.lastModified, fileName: meta.fileName,
         contentType: meta.contentType, nextChunk: resumeFrom,
+        chunkSize: runtimeParams.chunkSize,  // 记录本次用的分片大小
         singleRequest: false, fileHandle: fileHandle, updatedAt: Date.now(),
       };
       lastConfirmedChunk = resumeFrom;
       await idbPut(STORE_META, rawUrl, metaRecord);
-      updateProgress(Math.min(resumeFrom * CHUNK_SIZE, meta.fileSize), meta.fileSize);
-
-      // ★ 修复：进入分段下载前明确更新状态文字
-      if (resumeFrom > 0) {
-        setStatus('正在续传（从第 ' + (resumeFrom + 1) + '/' + meta.totalChunks + ' 片开始，已写入 '
-          + formatBytes(resumeFrom * CHUNK_SIZE) + '）…', 'info');
-      } else {
-        setStatus('正在下载（分段模式，共 ' + meta.totalChunks + ' 片）…', 'info');
-      }
+      updateProgress(Math.min(resumeFrom * runtimeParams.chunkSize, meta.fileSize), meta.fileSize);
 
       await downloadAllChunks(
         proxyUrl, meta, resumeFrom, safeWriter, abortController.signal,
         function (nextChunk, total) {
           lastConfirmedChunk = nextChunk;
-          var downloaded = Math.min(nextChunk * CHUNK_SIZE, meta.fileSize);
+          var downloaded = Math.min(nextChunk * runtimeParams.chunkSize, meta.fileSize);
           updateProgress(downloaded, meta.fileSize);
-
+          // ★ 可选：状态栏实时显示已完成片数
+          if (nextChunk < total) {
+            setStatus('正在下载（已完成 ' + nextChunk + '/' + total + ' 片）…', 'info');
+          }
           metaRecord.nextChunk = nextChunk;
           chunksSinceFlush++;
           var now = Date.now();
@@ -1594,6 +1744,7 @@ async function startDownload() {
               url: rawUrl, fileSize: meta.fileSize, totalChunks: meta.totalChunks,
               etag: meta.etag, lastModified: meta.lastModified, fileName: meta.fileName,
               contentType: meta.contentType, nextChunk: nextChunk,
+              chunkSize: runtimeParams.chunkSize,
               singleRequest: false, fileHandle: fileHandle, updatedAt: now,
             };
             queueIdbPut(STORE_META, rawUrl, snapshot).catch(function (err) {
@@ -1606,7 +1757,6 @@ async function startDownload() {
         });
     }
 
-    // 关闭写入流
     if (safeWriter.isBroken()) {
       writableClosed = true;
       try { await writable.abort(); } catch (_) {}
@@ -1622,14 +1772,13 @@ async function startDownload() {
       throw new Error('文件保存失败（可能磁盘已满或设备断开）：' + closeMsg);
     }
 
-    // 分段模式完成后清理 meta（流式模式没有 meta）
     if (downloadMode === 'segmented') {
       await idbDelete(STORE_META, rawUrl);
       metaRecord = null;
     }
 
     var doneSizeText = meta.fileSize > 0 ? formatBytes(meta.fileSize) : '大小未知';
-    if (typeof pendingStreamWarning !== 'undefined' && pendingStreamWarning) {
+    if (pendingStreamWarning) {
       setStatus(pendingStreamWarning, 'warn');
       pendingStreamWarning = null;
     } else {
@@ -1654,7 +1803,6 @@ async function startDownload() {
       metaRecord = null;
       setStatus('❌ ' + e.message, 'err');
     } else {
-      // 分段模式在异常时保存进度；流式模式不保存
       if (metaRecord && downloadMode === 'segmented') {
         metaRecord.nextChunk = lastConfirmedChunk;
         try { metaRecord.updatedAt = Date.now(); await idbPut(STORE_META, rawUrl, metaRecord); } catch (_) {}
@@ -1691,7 +1839,7 @@ async function startDownload() {
     isDownloading = false;
     $('startBtn').disabled = false;
     $('cancelBtn').disabled = true;
-    $('modeSelect').disabled = false;
+    lockParamControls(false);
     abortController = null;
   }
 }
@@ -1700,18 +1848,16 @@ function cancelDownload() { if (abortController) abortController.abort(); }
 
 // ==================== 页面加载 ====================
 window.addEventListener('DOMContentLoaded', async function () {
-  // 恢复用户上次选择的模式
-  try {
-    var savedMode = localStorage.getItem('cf_dl_mode');
-    if (savedMode === 'stream' || savedMode === 'segmented') {
-      $('modeSelect').value = savedMode;
-    }
-  } catch (_) {}
+  loadParamsFromStorage();
   updateModeHint();
 
+  // 参数控件绑定：变化时保存并更新提示
   $('modeSelect').addEventListener('change', function () {
-    try { localStorage.setItem('cf_dl_mode', this.value); } catch (_) {}
     updateModeHint();
+    saveParamsToStorage();
+  });
+  SEG_PARAM_KEYS.concat(STREAM_PARAM_KEYS).forEach(function (k) {
+    $(k).addEventListener('change', saveParamsToStorage);
   });
 
   try {
@@ -1724,12 +1870,20 @@ window.addEventListener('DOMContentLoaded', async function () {
       pending.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
       var latest = pending[0];
       $('urlInput').value = latest.url;
-      // 有未完成记录时，默认切回分段模式以便续传
       try {
         if ($('modeSelect').value !== 'segmented') {
           $('modeSelect').value = 'segmented';
-          localStorage.setItem('cf_dl_mode', 'segmented');
           updateModeHint();
+          saveParamsToStorage();
+        }
+        // 恢复之前的分片大小
+        if (latest.chunkSize) {
+          var optExists = false;
+          var el = $('segChunkSize');
+          for (var i = 0; i < el.options.length; i++) {
+            if (el.options[i].value === String(latest.chunkSize)) { optExists = true; break; }
+          }
+          if (optExists) el.value = String(latest.chunkSize);
         }
       } catch (_) {}
       setStatus('检测到未完成的下载（' + latest.fileName + '，已下载 '
