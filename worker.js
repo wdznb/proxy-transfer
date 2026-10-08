@@ -2,9 +2,9 @@
  * Cloudflare Worker：分段代理下载 + 流式写入硬盘 + 断点续传
  * 
  * 本轮修复：
- *   - 服务器不支持分片时，无论文件大小一律自动切换到单请求流式模式
- *   - MAX_SINGLE_REQUEST_BYTES 提升到 4GB（覆盖正常大文件）
- *   - 单请求模式的 UI 提示更明确（大文件提示无断点续传能力）
+ *   - 单请求流式模式取消 "数据长度不匹配" 校验
+ *     （很多服务器 Content-Length 不准确：动态生成、被压缩、分块等）
+ *   - 仅保留无限流硬上限防御，不阻塞正常下载
  */
 
 const CHUNK_SIZE = 64 * 1024;
@@ -36,9 +36,8 @@ const DNS_INFLIGHT_TIMEOUT_MS = 10000;
 
 const IDB_BATCH_SIZE = 8;
 
-// ★ 单请求模式硬上限提升到 4GB，覆盖正常大文件场景
-const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;
-const SINGLE_REQUEST_SIZE_BUFFER = 4 * 1024 * 1024;  // 已知大小 + 4MB 缓冲
+const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;  // 4GB 硬上限，防无限流
+const SINGLE_REQUEST_SIZE_BUFFER = 4 * 1024 * 1024;
 
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -371,7 +370,7 @@ function corsHeaders(request, env) {
     'Access-Control-Allow-Headers': 'Range, If-Range, X-Downloader-Auth',
     'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Expose-Headers':
-      'Content-Range, Content-Length, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Upstream-Content-Length, X-Unknown-Size, X-Stream-Fallback',
+      'Content-Range, Content-Length, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Upstream-Content-Length, X-Unknown-Size',
     'Cache-Control': 'no-store',
     'Vary': 'Origin',
   };
@@ -487,7 +486,7 @@ async function fetchWithRedirectGuard(targetUrl, options, maxRedirects, env, ctx
   throw new Error('重定向处理异常');
 }
 
-// ==================== 流截断（TransformStream + 外部 AbortController） ====================
+// ==================== 流截断 ====================
 function buildTruncatingTransform(maxLength, upstreamCtrl) {
   var read = 0;
   var truncated = false;
@@ -816,7 +815,7 @@ async function idbCleanupStale(maxAgeMs) {
   });
 }
 
-// ==================== IndexedDB 任务调度器（MessageChannel） ====================
+// ==================== IndexedDB 任务调度器 ====================
 var idbPendingTasks = [];
 var idbWriteInFlight = false;
 
@@ -970,7 +969,7 @@ async function probeFile(proxyUrl, outerSignal) {
       throw new Error('无法获取文件信息：' + (errText || ('HTTP ' + resp.status)));
     }
 
-    // ============ 服务器返回 200：不支持 Range，进入单请求流式模式 ============
+    // 服务器返回 200：不支持 Range，进入单请求流式模式
     if (resp.status === 200) {
       var xUnknownSize = resp.headers.get('X-Unknown-Size') === '1';
       var upCl = resp.headers.get('X-Upstream-Content-Length');
@@ -1017,11 +1016,10 @@ async function probeFile(proxyUrl, outerSignal) {
         throw new Error('服务器不支持分段下载且未返回文件大小');
       }
 
-      // ★ 修复：不再因为文件大而拒绝，一律进入单请求流式模式
       releaseBody(resp);
       return {
         fileSize: cl, totalChunks: 1, singleRequest: true, unknownSize: false,
-        streamFallback: cl > CHUNK_SIZE,  // 大文件标记为流式回退（无断点续传）
+        streamFallback: cl > CHUNK_SIZE,
         contentType: contentType2, etag: etag2, lastModified: lastModified2, fileName: fileName2,
       };
     }
@@ -1140,7 +1138,10 @@ async function downloadChunk(proxyUrl, index, start, end, outerSignal) {
   }
 }
 
-// ==================== 单请求流式下载 ====================
+// ==================== 单请求流式下载（不再校验长度） ====================
+// ★ 修复：移除 totalRead !== fileSize 的校验
+//   - 服务器可能返回动态内容、Content-Length 不准确、压缩传输后长度不符
+//   - 只保留硬上限（防无限流），不因长度差异判定失败
 async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, outerSignal, onProgress) {
   var knownSize = fileSize > 0;
   var maxAllowedBytes = knownSize
@@ -1161,11 +1162,12 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
     if (resp.status !== 200) throw new Error('单请求模式期望 200，实际 ' + resp.status);
 
     if (!resp.body) {
+      // 极老浏览器降级：arrayBuffer 一次性读取
       var buf = await resp.arrayBuffer();
-      if (knownSize && buf.byteLength !== fileSize) {
-        throw new Error('单请求数据长度不匹配：期望 ' + fileSize + '，实际 ' + buf.byteLength);
+      // ★ 移除长度校验，只保留硬上限
+      if (buf.byteLength > maxAllowedBytes) {
+        throw new Error('单请求响应超过上限 ' + formatBytes(maxAllowedBytes) + '，疑似恶意源站');
       }
-      if (buf.byteLength > maxAllowedBytes) throw new Error('单请求响应超过上限 ' + formatBytes(maxAllowedBytes) + '，疑似恶意源站');
       await safeWriter.write(0, buf);
       onProgress(buf.byteLength, fileSize);
       return;
@@ -1185,6 +1187,7 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
       var chunk = result.value;
       if (chunk && chunk.byteLength > 0) {
         totalRead += chunk.byteLength;
+        // ★ 仅保留硬上限防御，不校验与 Content-Length 是否一致
         if (totalRead > maxAllowedBytes) {
           try { await reader.cancel(); } catch (_) {}
           throw new Error('单请求响应超过上限 ' + formatBytes(maxAllowedBytes) + '（实际已收到 '
@@ -1196,9 +1199,12 @@ async function downloadSingleRequestStreaming(proxyUrl, fileSize, safeWriter, ou
       }
     }
 
-    if (knownSize && totalRead !== fileSize) {
-      throw new Error('单请求数据长度不匹配：期望 ' + fileSize + '，实际 ' + totalRead);
-    }
+    // ★ 已移除 "if (knownSize && totalRead !== fileSize) throw ..." 校验
+    //   实际下载字节数可能因以下原因与声明值不同：
+    //   1. 服务器动态生成内容，Content-Length 只是估计值
+    //   2. 上游返回压缩流但未声明或声明错误
+    //   3. CDN 边缘节点返回的内容与源站有细微差异
+    //   强行校验会导致正常文件被判为失败
   } finally {
     outerSignal.removeEventListener('abort', onOuterAbort);
   }
@@ -1406,12 +1412,8 @@ async function startDownload() {
       var newSingle = !!meta.singleRequest;
 
       if (newSingle) {
-        // 单请求模式：无法续传
-        if (oldSingle) {
-          setStatus('该文件为单请求模式（服务器不支持 Range），无法续传，将重新下载', 'warn');
-        } else {
-          setStatus('服务器行为变化（分段→单请求），将从头上传', 'warn');
-        }
+        if (oldSingle) setStatus('该文件为单请求模式（服务器不支持 Range），无法续传，将重新下载', 'warn');
+        else setStatus('服务器行为变化（分段→单请求），将从头上传', 'warn');
         await idbDelete(STORE_META, rawUrl);
         existingMeta = null;
         resumeFrom = 0;
@@ -1461,7 +1463,6 @@ async function startDownload() {
     updateProgress(Math.min(resumeFrom * CHUNK_SIZE, meta.fileSize), meta.fileSize);
 
     if (meta.singleRequest) {
-      // ★ 单请求模式：根据文件大小和是否已知大小给出合适提示
       if (meta.unknownSize) {
         setStatus('⚠️ 服务器不支持分段下载，已自动切换为单请求流式模式（大小未知，中断后需重新下载）', 'warn');
       } else if (meta.streamFallback) {
@@ -1573,7 +1574,6 @@ async function startDownload() {
         writableClosed = true;
       }
     }
-    try { await waitIdleQueueOrTimeout(); } catch (_) {}
     try { await waitIdbQueue(); } catch (_) {}
     await new Promise(function (r) { setTimeout(r, 100); });
     isDownloading = false;
@@ -1581,11 +1581,6 @@ async function startDownload() {
     $('cancelBtn').disabled = true;
     abortController = null;
   }
-}
-
-async function waitIdleQueueOrTimeout() {
-  // 占位函数，保持 finally 块兼容
-  return Promise.resolve();
 }
 
 function cancelDownload() { if (abortController) abortController.abort(); }
