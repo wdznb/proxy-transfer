@@ -2,16 +2,12 @@
  * Cloudflare Worker：分段代理下载 + 流式写入硬盘 + 断点续传
  * 
  * 本轮修复：
- *   - truncateToLength 改用 TransformStream + 外部 AbortController
- *   - IndexedDB 单例重连互斥锁
- *   - dohQuery 分块累积后再 decode（防极小 chunk GC 压力）
- *   - drainIdbQueue 用 MessageChannel 降低调度延迟
- *   - handleProxy 2xx 无长度信息时返回 502
- *   - probeFile X-Unknown-Size 优先于 Content-Length
- *   - 5xx body cancel 类型检查
+ *   - 服务器不支持分片时，无论文件大小一律自动切换到单请求流式模式
+ *   - MAX_SINGLE_REQUEST_BYTES 提升到 4GB（覆盖正常大文件）
+ *   - 单请求模式的 UI 提示更明确（大文件提示无断点续传能力）
  */
 
-const CHUNK_SIZE = 2 * 1024 * 1024;
+const CHUNK_SIZE = 64 * 1024;
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 3;
 const STORE_META = 'meta';
@@ -27,21 +23,22 @@ const MAX_CNAME_DEPTH = 5;
 const DOH_TIMEOUT_MS = 5000;
 const DOH_MAX_RESPONSE_BYTES = 10 * 1024;
 const DOH_DECODE_THRESHOLD = 1024;
-const CONCURRENCY = 3;
+const CONCURRENCY = 1;
 
 const MAX_PENDING_CHUNKS = 15;
 const MAX_PENDING_BYTES = 40 * 1024 * 1024;
 
-const PER_IP_FETCH_TIMEOUT_MS = 8000;
-const TOTAL_FETCH_TIMEOUT_MS = 15000;
+const PER_IP_FETCH_TIMEOUT_MS = 12000;
+const TOTAL_FETCH_TIMEOUT_MS = 25000;
 const MAX_IPS_TO_TRY = 3;
 
 const DNS_INFLIGHT_TIMEOUT_MS = 10000;
 
 const IDB_BATCH_SIZE = 8;
 
-const MAX_SINGLE_REQUEST_BYTES = 10 * 1024 * 1024;
-const SINGLE_REQUEST_SIZE_BUFFER = 1024 * 1024;
+// ★ 单请求模式硬上限提升到 4GB，覆盖正常大文件场景
+const MAX_SINGLE_REQUEST_BYTES = 4 * 1024 * 1024 * 1024;
+const SINGLE_REQUEST_SIZE_BUFFER = 4 * 1024 * 1024;  // 已知大小 + 4MB 缓冲
 
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -152,7 +149,7 @@ function isPrivateHostname(hostname) {
   return false;
 }
 
-// ==================== DoH 查询（分块累积解码） ====================
+// ==================== DoH 查询 ====================
 function concatUint8(chunks, totalLen) {
   var merged = new Uint8Array(totalLen);
   var offset = 0;
@@ -193,7 +190,6 @@ async function dohQuery(name, type) {
     var decoder = new TextDecoder('utf-8');
     var text = '';
     var totalRead = 0;
-    // ★ 累积缓冲区：达到阈值后再 decode，避免极小 chunk 造成 GC 压力
     var pendingChunks = [];
     var pendingBytes = 0;
 
@@ -375,7 +371,7 @@ function corsHeaders(request, env) {
     'Access-Control-Allow-Headers': 'Range, If-Range, X-Downloader-Auth',
     'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Expose-Headers':
-      'Content-Range, Content-Length, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Upstream-Content-Length, X-Unknown-Size',
+      'Content-Range, Content-Length, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Upstream-Content-Length, X-Unknown-Size, X-Stream-Fallback',
     'Cache-Control': 'no-store',
     'Vary': 'Origin',
   };
@@ -453,7 +449,6 @@ async function fetchWithRedirectGuard(targetUrl, options, maxRedirects, env, ctx
         if (tryResp.status >= 500 && tryResp.status < 600) {
           last5xxStatus = tryResp.status;
           last5xxStatusText = tryResp.statusText;
-          // ★ 修复：严格类型检查 body.cancel
           try {
             if (tryResp.body && typeof tryResp.body.cancel === 'function') {
               var p = tryResp.body.cancel();
@@ -493,7 +488,6 @@ async function fetchWithRedirectGuard(targetUrl, options, maxRedirects, env, ctx
 }
 
 // ==================== 流截断（TransformStream + 外部 AbortController） ====================
-// ★ 修复：改用 TransformStream（C++ 层优化），达到上限时通过外部 AbortController 中断上游
 function buildTruncatingTransform(maxLength, upstreamCtrl) {
   var read = 0;
   var truncated = false;
@@ -509,7 +503,6 @@ function buildTruncatingTransform(maxLength, upstreamCtrl) {
         read = maxLength;
         truncated = true;
         try { controller.terminate(); } catch (_) {}
-        // 立即中断上游 fetch 的 body 消费
         try { upstreamCtrl.abort(); } catch (_) {}
       }
     },
@@ -549,7 +542,6 @@ async function handleProxy(request, env, ctx) {
   var clientUA = request.headers.get('User-Agent');
   forwardHeaders.set('User-Agent', clientUA || DEFAULT_UA);
 
-  // 用于截断时中断上游 fetch 的 AbortController
   const upstreamCtrl = new AbortController();
 
   try {
@@ -599,7 +591,6 @@ async function handleProxy(request, env, ctx) {
       });
     }
 
-    // ★ 修复：无长度信息时严格检查状态码和传输编码
     var upstreamTE = upstream.headers.get('transfer-encoding') || '';
     var upstreamHasChunked = upstreamTE.toLowerCase().indexOf('chunked') !== -1;
 
@@ -617,7 +608,6 @@ async function handleProxy(request, env, ctx) {
       }
       responseHeaders.set('X-Unknown-Size', '1');
     } else if (upstream.status >= 200 && upstream.status < 300) {
-      // ★ 修复：2xx 但无长度信息且非 200 → 明确拒绝
       try {
         if (upstream.body && typeof upstream.body.cancel === 'function') {
           var bp2 = upstream.body.cancel();
@@ -702,8 +692,8 @@ function getHTML() {
   </div>
   <div class="status" id="statusMsg"></div>
   <div class="hint">
-    提示：每下载完一片会立即写入你选择的文件。刷新页面后重新输入同一地址，会自动续传。
-    需 Chrome / Edge 等支持 File System Access API 的浏览器。<br>
+    提示：每下载完一片会立即写入你选择的文件。刷新页面后重新输入同一地址，会自动续传。<br>
+    若服务器不支持分段下载（不响应 Range 请求），将自动切换为单请求流式模式，此时中断后需重新下载。<br>
     安全提示：本页面会将文件句柄保存在浏览器 IndexedDB 中以实现自动续传。若在公用设备使用，请及时清理浏览器数据。
   </div>
 </div>
@@ -734,7 +724,6 @@ var dbPendingOpen = null;
 
 function openDB() {
   if (dbPromise) return dbPromise;
-  // ★ 修复：重连过程中后续调用复用同一个 Promise，避免并发 open
   if (dbPendingOpen) return dbPendingOpen;
 
   dbPendingOpen = new Promise(function (resolve, reject) {
@@ -831,7 +820,6 @@ async function idbCleanupStale(maxAgeMs) {
 var idbPendingTasks = [];
 var idbWriteInFlight = false;
 
-// ★ 修复：用 MessageChannel 让出主线程，延迟降到微秒级
 var idbChan = (typeof MessageChannel !== 'undefined') ? new MessageChannel() : null;
 var idbNextBatch = null;
 if (idbChan) {
@@ -982,6 +970,7 @@ async function probeFile(proxyUrl, outerSignal) {
       throw new Error('无法获取文件信息：' + (errText || ('HTTP ' + resp.status)));
     }
 
+    // ============ 服务器返回 200：不支持 Range，进入单请求流式模式 ============
     if (resp.status === 200) {
       var xUnknownSize = resp.headers.get('X-Unknown-Size') === '1';
       var upCl = resp.headers.get('X-Upstream-Content-Length');
@@ -989,7 +978,6 @@ async function probeFile(proxyUrl, outerSignal) {
       var transferEncoding = resp.headers.get('Transfer-Encoding') || '';
       var isChunked = transferEncoding.toLowerCase().indexOf('chunked') !== -1;
 
-      // ★ 修复：X-Unknown-Size 优先于 Content-Length
       if (xUnknownSize) cl = 0;
 
       var contentType2 = resp.headers.get('Content-Type') || 'application/octet-stream';
@@ -1021,6 +1009,7 @@ async function probeFile(proxyUrl, outerSignal) {
           releaseBody(resp);
           return {
             fileSize: 0, totalChunks: 1, singleRequest: true, unknownSize: true,
+            streamFallback: true,
             contentType: contentType2, etag: etag2, lastModified: lastModified2, fileName: fileName2,
           };
         }
@@ -1028,14 +1017,11 @@ async function probeFile(proxyUrl, outerSignal) {
         throw new Error('服务器不支持分段下载且未返回文件大小');
       }
 
-      if (cl > CHUNK_SIZE) {
-        releaseBody(resp);
-        throw new Error('服务器不支持分段下载（文件 ' + formatBytes(cl) + ' 大于单片上限 ' + formatBytes(CHUNK_SIZE) + '）');
-      }
-
+      // ★ 修复：不再因为文件大而拒绝，一律进入单请求流式模式
       releaseBody(resp);
       return {
         fileSize: cl, totalChunks: 1, singleRequest: true, unknownSize: false,
+        streamFallback: cl > CHUNK_SIZE,  // 大文件标记为流式回退（无断点续传）
         contentType: contentType2, etag: etag2, lastModified: lastModified2, fileName: fileName2,
       };
     }
@@ -1099,6 +1085,7 @@ async function probeFile(proxyUrl, outerSignal) {
     return {
       fileSize: fileSize, totalChunks: Math.ceil(fileSize / CHUNK_SIZE),
       singleRequest: false, unknownSize: false,
+      streamFallback: false,
       contentType: contentType, etag: etag, lastModified: lastModified, fileName: fileName
     };
   } catch (e) {
@@ -1419,8 +1406,12 @@ async function startDownload() {
       var newSingle = !!meta.singleRequest;
 
       if (newSingle) {
-        if (oldSingle) setStatus('该文件为单请求模式（服务器不支持 Range），无法续传，将重新下载', 'warn');
-        else setStatus('服务器行为变化（分段→单请求），将从头上传', 'warn');
+        // 单请求模式：无法续传
+        if (oldSingle) {
+          setStatus('该文件为单请求模式（服务器不支持 Range），无法续传，将重新下载', 'warn');
+        } else {
+          setStatus('服务器行为变化（分段→单请求），将从头上传', 'warn');
+        }
         await idbDelete(STORE_META, rawUrl);
         existingMeta = null;
         resumeFrom = 0;
@@ -1470,7 +1461,17 @@ async function startDownload() {
     updateProgress(Math.min(resumeFrom * CHUNK_SIZE, meta.fileSize), meta.fileSize);
 
     if (meta.singleRequest) {
-      setStatus('正在下载（单请求流式模式' + (meta.unknownSize ? '，大小未知' : '') + '）…', 'info');
+      // ★ 单请求模式：根据文件大小和是否已知大小给出合适提示
+      if (meta.unknownSize) {
+        setStatus('⚠️ 服务器不支持分段下载，已自动切换为单请求流式模式（大小未知，中断后需重新下载）', 'warn');
+      } else if (meta.streamFallback) {
+        setStatus('⚠️ 服务器不支持分段下载，已自动切换为单请求流式模式（'
+          + formatBytes(meta.fileSize) + '，中断后无法续传）', 'warn');
+      } else {
+        setStatus('服务器不支持分段下载，已自动切换为单请求流式模式（'
+          + formatBytes(meta.fileSize) + '）', 'info');
+      }
+
       await downloadSingleRequestStreaming(
         proxyUrl, meta.fileSize, safeWriter, abortController.signal,
         function (bytesRead, fileSize) {
@@ -1553,9 +1554,9 @@ async function startDownload() {
         try { await idbDelete(STORE_META, rawUrl); } catch (_) {}
       }
       if (abortController && abortController.signal.aborted) {
-        setStatus('下载已取消' + (metaRecord && !metaRecord.singleRequest ? '（进度已保存，可续传）' : ''), 'err');
+        setStatus('下载已取消' + (metaRecord && !metaRecord.singleRequest ? '（进度已保存，可续传）' : '（单请求模式需重新下载）'), 'err');
       } else if (e && e.message === 'ABORTED') {
-        setStatus('下载已取消' + (metaRecord && !metaRecord.singleRequest ? '（进度已保存，可续传）' : ''), 'err');
+        setStatus('下载已取消' + (metaRecord && !metaRecord.singleRequest ? '（进度已保存，可续传）' : '（单请求模式需重新下载）'), 'err');
       } else {
         setStatus('❌ ' + (e && e.message ? e.message : String(e)), 'err');
       }
@@ -1572,6 +1573,7 @@ async function startDownload() {
         writableClosed = true;
       }
     }
+    try { await waitIdleQueueOrTimeout(); } catch (_) {}
     try { await waitIdbQueue(); } catch (_) {}
     await new Promise(function (r) { setTimeout(r, 100); });
     isDownloading = false;
@@ -1579,6 +1581,11 @@ async function startDownload() {
     $('cancelBtn').disabled = true;
     abortController = null;
   }
+}
+
+async function waitIdleQueueOrTimeout() {
+  // 占位函数，保持 finally 块兼容
+  return Promise.resolve();
 }
 
 function cancelDownload() { if (abortController) abortController.abort(); }
