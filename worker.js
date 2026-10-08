@@ -7,7 +7,7 @@
  *   - 仅保留无限流硬上限防御，不阻塞正常下载
  */
 
-const CHUNK_SIZE = 64 * 1024;
+const CHUNK_SIZE = 256 * 1024;
 const DB_NAME = 'cf-downloader-db';
 const DB_VERSION = 3;
 const STORE_META = 'meta';
@@ -1480,13 +1480,20 @@ async function startDownload() {
           updateProgress(bytesRead, fileSize);
         });
     } else {
+      if (resumeFrom > 0) {
+        setStatus('正在续传（从第 ' + (resumeFrom + 1) + '/' + meta.totalChunks + ' 片开始）…', 'info');
+      } else {
+        setStatus('正在下载（分段模式，共 ' + meta.totalChunks + ' 片）…', 'info');
+      }
       await downloadAllChunks(
         proxyUrl, meta, resumeFrom, safeWriter, abortController.signal,
         function (nextChunk, total) {
           lastConfirmedChunk = nextChunk;
           var downloaded = Math.min(nextChunk * CHUNK_SIZE, meta.fileSize);
           updateProgress(downloaded, meta.fileSize);
-
+          if (nextChunk < total) {
+            setStatus('正在下载（已完成 ' + nextChunk + '/' + total + ' 片）…', 'info');
+          }
           metaRecord.nextChunk = nextChunk;
           chunksSinceFlush++;
           var now = Date.now();
